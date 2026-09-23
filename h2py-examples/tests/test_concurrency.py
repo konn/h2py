@@ -157,7 +157,10 @@ def test_interruptible_loop_is_interrupted_promptly_by_sigint():
     finally:
         killer.wait()
         signal.signal(signal.SIGINT, previous)
-    assert elapsed < 1.5, elapsed
+    # Uninterrupted, the loop runs for about 18 s on an Apple M-series machine
+    # and longer on slower ones; the signal is sent after 0.2 s, and the
+    # bound leaves room for a loaded runner to start the shell late.
+    assert elapsed < 3.0, elapsed
 
 
 def test_interrupt_main_from_a_thread_cannot_reach_an_attached_loop():
@@ -171,12 +174,18 @@ def test_interrupt_main_from_a_thread_cannot_reach_an_attached_loop():
     try:
         timer.start()
         t0 = time.perf_counter()
-        assert c.interruptible_loop(5_000_000) == 5_000_000
+        assert c.interruptible_loop(10_000_000) == 10_000_000
         t1 = time.perf_counter()
-        time.sleep(0.05)
+        # The timer, due during the loop, runs once the loop gives the
+        # interpreter back; the handler runs at a bytecode after that.
+        timer.join()
+        deadline = time.perf_counter() + 5
+        while not seen and time.perf_counter() < deadline:
+            time.sleep(0.001)
     finally:
         timer.cancel()
         signal.signal(signal.SIGINT, previous)
+    assert t1 - t0 > 0.1, "the loop ended before the timer was due; lengthen it"
     assert seen, "the interrupt was never delivered"
     assert seen[0] >= t1 - 1e-3, (seen, t0, t1)
 
@@ -189,7 +198,8 @@ def test_sleep_then_check_reports_interrupt_main_as_a_value():
     timer = threading.Timer(0.1, _thread.interrupt_main)
     try:
         timer.start()
-        assert c.sleep_then_check(0.4) is True
+        # The timer is due at 0.1 s, well inside the detached second.
+        assert c.sleep_then_check(1.0) is True
         time.sleep(0.05)
     finally:
         timer.cancel()
@@ -210,6 +220,23 @@ def test_shared_counter_basics():
     assert s.hold_share(0.0) == 8
 
 
+def _wait_until_busy(probe, thread):
+    """Probe until the call on the other thread holds the object, that is, until probe() answers busy.
+
+    The probe may get through before that call has begun, so it must change
+    nothing (a reader, or a writer that writes nothing); the call is seen
+    holding the object whenever it does, however late the thread started.
+    """
+    while True:
+        try:
+            probe()
+        except RuntimeError as e:
+            assert "busy" in str(e), e
+            return
+        assert thread.is_alive(), "the call on the other thread ended before it was seen holding the object"
+        time.sleep(0.001)
+
+
 def _run_in_thread(fn):
     result = {}
 
@@ -227,7 +254,7 @@ def _run_in_thread(fn):
 def test_writer_is_busy_against_a_detached_writer():
     s = c.SharedCounter(0)
     t, result = _run_in_thread(lambda: s.hold_mut(0.6))
-    time.sleep(0.15)
+    _wait_until_busy(s.get, t)
     with pytest.raises(RuntimeError, match="busy"):
         s.incr(1)
     with pytest.raises(RuntimeError, match="busy"):
@@ -245,7 +272,7 @@ def test_writer_is_busy_against_a_detached_writer():
 def test_readers_proceed_together_and_a_writer_is_busy():
     s = c.SharedCounter(3)
     t, result = _run_in_thread(lambda: s.hold_share(0.6))
-    time.sleep(0.15)
+    _wait_until_busy(lambda: s.incr(0), t)
     assert s.get() == 3
     assert s.hold_share(0.0) == 3
     with pytest.raises(RuntimeError, match="busy"):
@@ -261,12 +288,14 @@ def test_readers_proceed_together_and_a_writer_is_busy():
 
 def test_two_detached_readers_from_two_threads():
     s = c.SharedCounter(9)
-    t1, r1 = _run_in_thread(lambda: s.hold_share(0.4))
-    t2, r2 = _run_in_thread(lambda: s.hold_share(0.4))
-    t0 = time.perf_counter()
-    t1.join()
+    t1, r1 = _run_in_thread(lambda: s.hold_share(1.0))
+    _wait_until_busy(lambda: s.incr(0), t1)
+    # A second detached reader, on another thread, starts and ends while the
+    # first still holds the payload: neither waits for the other.
+    t2, r2 = _run_in_thread(lambda: s.hold_share(0.2))
     t2.join()
-    assert time.perf_counter() - t0 < 0.8
+    assert t1.is_alive(), "the first reader's hold ended before the second reader's did"
+    t1.join()
     assert r1 == {"value": 9} and r2 == {"value": 9}
 
 
@@ -353,12 +382,10 @@ def _advances_during(call, min_seconds=0.3):
     return result
 
 
-def _busy_during(start, probe, seconds=0.5):
-    """probe() answers busy while start() runs on another thread."""
+def _busy_during(start, probe):
+    """probe() answers busy while start() runs on another thread; probe must change nothing."""
     t, result = _run_in_thread(start)
-    time.sleep(seconds / 4)
-    with pytest.raises(RuntimeError, match="busy"):
-        probe()
+    _wait_until_busy(probe, t)
     t.join()
     assert "error" not in result, result
     return result["value"]
@@ -381,9 +408,9 @@ def test_share_receiver_bio_body_releases_the_interpreter():
     s = c.Series([1, 2, 3])
     assert _advances_during(lambda: s.hold_share_bio(0.3)) == 6
     # A writer is busy while the shared hold lasts; readers proceed.
-    assert _busy_during(lambda: s.hold_share_bio(0.5), lambda: s.scale(2)) == 6
+    assert _busy_during(lambda: s.hold_share_bio(0.5), lambda: s.scale(1)) == 6
     t, result = _run_in_thread(lambda: s.hold_share_bio(0.4))
-    time.sleep(0.1)
+    _wait_until_busy(lambda: s.scale(1), t)
     assert s.total() == 6
     t.join()
     assert result == {"value": 6}
@@ -396,20 +423,34 @@ def test_mut_receiver_bio_body_mutates_the_vector_detached():
     # Both a writer and a reader are busy while the mutable hold lasts.
     _busy_during(lambda: s.scale_bio(2, 0.5), lambda: s.total())
     assert s.total() == 24
-    _busy_during(lambda: s.scale_bio(2, 0.5), lambda: s.scale(3))
+    _busy_during(lambda: s.scale_bio(2, 0.5), lambda: s.scale(1))
     assert s.total() == 48
+
+
+def _reps_lasting(call, seconds):
+    """How many repetitions make call(reps) run for about seconds.
+
+    The rate is measured over at least a tenth of that time: a measurement of a
+    millisecond or two, which a single stall of the thread can inflate
+    several times over, once sized a call far below its target.
+    """
+    reps = 1000
+    while True:
+        t0 = time.perf_counter()
+        call(reps)
+        elapsed = time.perf_counter() - t0
+        if elapsed >= seconds / 10:
+            return max(reps, int(reps * seconds / elapsed))
+        reps *= 4
 
 
 def test_bo_body_registered_detached_releases_the_interpreter():
     s = c.Series(list(range(2000)))
     expected = sum(range(2000))
-    # Calibrate the pure kernel so that it runs for a few tenths of a second.
-    t0 = time.perf_counter()
-    assert s.total_detached(200) == expected * 200
-    per_rep = (time.perf_counter() - t0) / 200
-    reps = max(1, int(0.4 / per_rep))
+    # The pure kernel runs for about half a second.
+    reps = _reps_lasting(s.total_detached, 0.5)
     assert _advances_during(lambda: s.total_detached(reps), min_seconds=0.0) == expected * reps
-    assert _busy_during(lambda: s.total_detached(reps), lambda: s.scale(2), seconds=0.4) == expected * reps
+    assert _busy_during(lambda: s.total_detached(reps), lambda: s.scale(1)) == expected * reps
     assert s.total() == expected
 
 

@@ -232,7 +232,15 @@ def test_detached_holds_from_another_thread_are_busy():
 
     t = threading.Thread(target=target)
     t.start()
-    time.sleep(0.1)
+    # The hold may begin late on a loaded machine: read until it is seen.
+    while True:
+        try:
+            c.get()
+        except RuntimeError as e:
+            assert "busy" in str(e), e
+            break
+        assert t.is_alive(), "the hold ended before it was seen"
+        time.sleep(0.001)
     with pytest.raises(RuntimeError, match="busy"):
         c.get()
     with pytest.raises(RuntimeError, match="busy"):
