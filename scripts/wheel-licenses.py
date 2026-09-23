@@ -170,6 +170,11 @@ def main(argv: list[str] | None = None) -> int:
         metavar="DIR",
         help="the unpacked source tree of the same GHC, for the licences of its boot libraries",
     )
+    parser.add_argument(
+        "--module",
+        metavar="NAME",
+        help="with --check-wheel, the module the wheel carries (default: the foreign library's name)",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -195,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
             licences,
             own_file,
             read_expression(Path(args.pyproject)),
-            args.component.split(":", 1)[1],
+            args.module or args.component.split(":", 1)[1],
         )
 
     if args.write:
