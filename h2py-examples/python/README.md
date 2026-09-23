@@ -12,7 +12,8 @@ The example CPython extension module of [H2Py](https://github.com/konn/h2py), a 
 ```
 
 The module is built against the CPython limited API at 3.12, so one wheel per platform serves CPython 3.12 and later.
-It ships its own type stub (`h2py_examples.pyi`) and a `py.typed` marker.
+Wheels are built for macOS 11 and later (arm64 and x86_64) and for Linux with glibc 2.28 or later (`manylinux_2_28`, x86_64 and aarch64).
+It ships its type stubs as the stub-only package `h2py_examples-stubs`, with a `py.typed` marker.
 
 ## Building the wheel
 
@@ -20,7 +21,8 @@ The wheel can only be built from a checkout of the repository, because building 
 From the repository root:
 
 ```bash
-scripts/build-wheel.sh            # builds, repairs with delocate-wheel or auditwheel, verifies in a fresh venv
+scripts/build-wheel.sh            # macOS: builds, repairs with delocate-wheel, checks the wheel in a fresh venv
+scripts/manylinux-wheel.sh        # Linux, inside quay.io/pypa/manylinux_2_28_<arch>: the same with auditwheel
 ```
 
 See `hatch_build.py` for what the build hook does, and the repository README for the toolchain.
