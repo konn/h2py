@@ -9,13 +9,25 @@
 #    cp312-abi3-<platform>.
 #    The wheel is built straight from the source tree, never from an sdist,
 #    because the Haskell sources live outside the packaging directory.
-# 2. delocate-wheel (macOS) or auditwheel (Linux) copies every non-system
+# 2. delocate-wheel (macOS) or auditwheel (Linux), in a staging directory,
+#    copies every non-system
 #    dylib/.so the module links against, transitively, into the wheel and
 #    rewrites the install names / rpaths to point at the bundled copies.
 #    On macOS that is libHSh2py, libHSpure-borrow, libHSlinear-base, the GHC
 #    boot libraries and libHSrts; libffi, libiconv and libSystem come from the
 #    OS and are left alone.
-# 3. A throwaway venv installs the repaired wheel and imports the module.
+# 3. A throwaway venv installs the repaired wheel, and
+#    scripts/check-installed-wheel.py checks that the module and every Haskell
+#    library come from the wheel, and that the licences and stubs are there.
+#
+# On macOS the deployment target comes from cabal.project, which passes it to
+# GHC's C compiler, assembler and linker; MACOSX_DEPLOYMENT_TARGET is set to
+# the same version so that delocate rejects any library built for a newer
+# macOS, and the objects of the local packages are checked as well, because
+# GHC does not recompile a module when only those options change.
+#
+# On Linux, run it inside a manylinux image (scripts/manylinux-wheel.sh does)
+# and set H2PY_AUDITWHEEL_PLAT to the policy of that image.
 #
 # Usage: scripts/build-wheel.sh [python]
 #   python   the interpreter to build against; defaults to .venv/bin/python
@@ -35,79 +47,131 @@ if [ ! -x "${python}" ]; then
   exit 1
 fi
 uv="${UV:-$(command -v uv || echo "${HOME}/.local/bin/uv")}"
+
+if [ "$(uname -s)" = Darwin ]; then
+  target="$(grep -o -- '-mmacosx-version-min=[0-9.]*' cabal.project | sort -u | cut -d= -f2)"
+  if [ -z "${target}" ] || [ "$(printf '%s\n' "${target}" | wc -l)" -ne 1 ]; then
+    echo "build-wheel: cabal.project must set exactly one -mmacosx-version-min" >&2
+    exit 1
+  fi
+  if [ -n "${MACOSX_DEPLOYMENT_TARGET:-}" ] && [ "${MACOSX_DEPLOYMENT_TARGET}" != "${target}" ]; then
+    echo "build-wheel: MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET} but cabal.project targets ${target}" >&2
+    exit 1
+  fi
+  export MACOSX_DEPLOYMENT_TARGET="${target}"
+fi
 wheelhouse="${H2PY_WHEEL_DIR:-${root}/build/wheelhouse}"
 raw="${root}/build/wheel-raw"
-rm -rf "${raw}" "${wheelhouse}"
+# The wheel is repaired and checked in a staging directory, and moved into the
+# wheelhouse only once every check has passed, so that no wheel with a release
+# name stays behind from a failed build.
+stage="$(mktemp -d "${TMPDIR:-/tmp}/h2py-stage.XXXXXX")"
+tmp=""
+trap 'rm -rf "${stage}" ${tmp:+"${tmp}"}' EXIT
+rm -rf "${raw}"
 mkdir -p "${raw}" "${wheelhouse}"
 
-# The build front end and the repair tool live in the build interpreter's
-# environment; install them if they are missing (only ever adds packages).
-need=()
-"${python}" -c 'import build' 2>/dev/null || need+=(build)
-"${python}" -c 'import hatchling' 2>/dev/null || need+=(hatchling)
-case "$(uname -s)" in
-  Darwin) "${python}" -c 'import delocate' 2>/dev/null || need+=(delocate) ;;
-  *) "${python}" -c 'import auditwheel' 2>/dev/null || need+=(auditwheel) ;;
-esac
-if [ "${#need[@]}" -gt 0 ]; then
-  echo "build-wheel: installing ${need[*]} into $(dirname "${python}")"
-  "${uv}" pip install --python "${python}" "${need[@]}"
-fi
+# The build front end and the repair tools live in the build interpreter's
+# environment, at the versions h2py-examples/python/build-requirements.txt
+# locks with hashes.
+# Every Python step runs isolated (-I): the build/ directory at the root of
+# the tree would otherwise pass for the `build` package.
+lock="${root}/h2py-examples/python/build-requirements.txt"
+echo "build-wheel: installing the wheel tools into $(dirname "${python}") from ${lock##*/}"
+"${uv}" pip install --quiet --python "${python}" --require-hashes -r "${lock}"
 
 echo "build-wheel: building the wheel with ${python}"
 # --no-isolation: hatchling is already in the environment, and the hook wants
 # the interpreter whose headers cabal.project.local names, not a copy of it.
-"${python}" -m build --wheel --no-isolation --outdir "${raw}" "${root}/h2py-examples/python"
+"${python}" -I -m build --wheel --no-isolation --outdir "${raw}" "${root}/h2py-examples/python"
 wheel="$(ls "${raw}"/*.whl | head -1)"
 echo "build-wheel: raw wheel ${wheel} ($(du -h "${wheel}" | cut -f1))"
+
+if [ "$(uname -s)" = Darwin ]; then
+  # A module object compiled before the target changed keeps the old minimum
+  # version inside the linked library, where delocate cannot see it.
+  newer="$(find dist-newstyle/build -type f \( -name '*.o' -o -name '*.dyn_o' \) \
+      -not -path '*/t/*' -not -path '*/x/*' -not -path '*/b/*' -print0 \
+    | xargs -0 otool -l 2>/dev/null \
+    | awk -v target="${MACOSX_DEPLOYMENT_TARGET}" '
+        /^[^ \t].*:$/ { file = substr($0, 1, length($0) - 1) }
+        $1 == "minos" { split($2, v, "."); split(target, t, ".");
+                        if (v[1] + 0 > t[1] + 0 || (v[1] + 0 == t[1] + 0 && v[2] + 0 > t[2] + 0)) print file " (" $2 ")" }')"
+  if [ -n "${newer}" ]; then
+    echo "build-wheel: these objects were built for a macOS newer than ${MACOSX_DEPLOYMENT_TARGET}:" >&2
+    echo "${newer}" | head -20 >&2
+    echo "build-wheel: remove dist-newstyle/build and build again" >&2
+    exit 1
+  fi
+fi
 
 case "$(uname -s)" in
   Darwin)
     # delocate resolves the @rpath references through the LC_RPATH entries
     # that GHC wrote into the foreign library (the cabal store and the GHC
     # library directory), so no DYLD_LIBRARY_PATH is needed.
-    # delocate raises the wheel's macOS platform tag to the highest minimum
-    # OS version among the bundled libraries.  Libraries built on this
-    # machine without MACOSX_DEPLOYMENT_TARGET carry the host's version (the
-    # ghcup bindist's carry 11.0), so for a wheel that installs on older
-    # macOS, set MACOSX_DEPLOYMENT_TARGET before building the cabal store
-    # and the tree; the tag of the raw wheel comes from the interpreter's
-    # own sysconfig platform.
-    "${python}" -m delocate.cmd.delocate_wheel -w "${wheelhouse}" -v "${wheel}"
+    # With MACOSX_DEPLOYMENT_TARGET set (above, from cabal.project), delocate
+    # refuses any bundled library whose minimum macOS is newer than the
+    # target, and keeps the tag the hatch hook computed from it.
+    "${python}" -I -m delocate.cmd.delocate_wheel -w "${stage}" -v "${wheel}"
     ;;
   *)
-    # auditwheel repairs against a manylinux policy; the Haskell libraries are
-    # linked against the build machine's glibc, so the policy that applies is
-    # whatever `auditwheel show` reports for that machine, and the tag is
-    # chosen accordingly.  --plat must be passed when the default policy is
-    # too strict for the build host.
-    "${python}" -m auditwheel repair -w "${wheelhouse}" ${H2PY_AUDITWHEEL_PLAT:+--plat "${H2PY_AUDITWHEEL_PLAT}"} "${wheel}"
+    # auditwheel repairs against the manylinux policy of the image the build
+    # runs in (H2PY_AUDITWHEEL_PLAT, which scripts/manylinux-wheel.sh sets from
+    # the image); --only-plat keeps it from adding any other tag.
+    "${python}" -I -m auditwheel repair -w "${stage}" \
+      ${H2PY_AUDITWHEEL_PLAT:+--plat "${H2PY_AUDITWHEEL_PLAT}" --only-plat} "${wheel}"
     ;;
 esac
-repaired="$(ls "${wheelhouse}"/*.whl | head -1)"
-echo "build-wheel: repaired wheel ${repaired} ($(du -h "${repaired}" | cut -f1))"
+repaired="$(ls "${stage}"/*.whl | head -1)"
+echo "build-wheel: repaired wheel $(basename "${repaired}") ($(du -h "${repaired}" | cut -f1))"
 
-if [ -n "${H2PY_SKIP_VERIFY:-}" ]; then
-  exit 0
+# Every library the repair tool bundled has its licence in the wheel.
+"${python}" -I "${root}/scripts/wheel-licenses.py" --check-wheel "${repaired}" \
+  --licenses "${root}/h2py-examples/python/third-party-licenses" \
+  --pyproject "${root}/h2py-examples/python/pyproject.toml" flib:h2py_examples
+
+if [ "$(uname -s)" != Darwin ]; then
+  # glibc 2.41 and later refuse to load a library that asks for an executable
+  # stack, which a library without a GNU_STACK header does on x86_64, so every
+  # shared library in the wheel must have exactly one, without the E flag.
+  unpacked="${stage}/unpacked"
+  mkdir -p "${unpacked}"
+  unzip -q "${repaired}" -d "${unpacked}"
+  bad=""
+  while IFS= read -r -d '' lib; do
+    if ! headers="$(readelf -lW "${lib}")"; then
+      bad="${bad}${lib}: readelf failed"$'\n'
+      continue
+    fi
+    stacks="$(printf '%s\n' "${headers}" | awk '$1 == "GNU_STACK" { print $(NF - 1) }')"
+    if [ "$(printf '%s' "${stacks}" | grep -c .)" -ne 1 ] || printf '%s' "${stacks}" | grep -q E; then
+      bad="${bad}${lib}: GNU_STACK [${stacks}]"$'\n'
+    fi
+  done < <(find "${unpacked}" -type f -name '*.so*' -print0)
+  if [ -n "${bad}" ]; then
+    echo "build-wheel: these libraries ask for an executable stack, or cannot be read:" >&2
+    printf '%s' "${bad}" >&2
+    exit 1
+  fi
+  rm -rf "${unpacked}"
 fi
 
-# Verify in a venv that has nothing but the wheel: the module must import
-# from the bundled libraries alone, away from the cabal store and dist-newstyle.
-tmp="$(mktemp -d "${TMPDIR:-/tmp}/h2py-wheel.XXXXXX")"
-trap 'rm -rf "${tmp}"' EXIT
-"${uv}" venv --quiet --python "${python}" "${tmp}/venv"
-"${uv}" pip install --quiet --python "${tmp}/venv/bin/python" "${repaired}"
-(
-  cd "${tmp}"
-  "${tmp}/venv/bin/python" - <<'EOF'
-import h2py_examples, os
-assert h2py_examples.Counter(1).get() == 1
-assert h2py_examples.add(40, 2) == 42
-here = os.path.dirname(h2py_examples.__file__)
-stubs = os.path.join(here, "h2py_examples-stubs")
-assert os.path.isfile(os.path.join(stubs, "__init__.pyi")), "root stub missing"
-assert os.path.isfile(os.path.join(stubs, "shapes.pyi")), "submodule stub missing"
-assert os.path.isfile(os.path.join(stubs, "py.typed")), "py.typed missing"
-print("build-wheel: verified", h2py_examples.__file__)
-EOF
-)
+if [ -z "${H2PY_SKIP_VERIFY:-}" ]; then
+  # Verify in a venv that has nothing but the wheel: the module must import
+  # from the bundled libraries alone, away from the cabal store and dist-newstyle.
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/h2py-wheel.XXXXXX")"
+  "${uv}" venv --quiet --python "${python}" "${tmp}/venv"
+  "${uv}" pip install --quiet --python "${tmp}/venv/bin/python" "${repaired}"
+  (
+    cd "${tmp}"
+    "${tmp}/venv/bin/python" "${root}/scripts/check-installed-wheel.py" h2py-examples h2py_examples
+    "${tmp}/venv/bin/python" -c 'import h2py_examples as m; assert m.Counter(1).get() == 1 and m.add(40, 2) == 42'
+  )
+fi
+
+# Every check passed: the wheel replaces this package's previous ones.
+find "${wheelhouse}" -maxdepth 1 -name 'h2py_examples-*.whl' -delete
+mv "${repaired}" "${wheelhouse}/"
+rm -rf "${raw}"
+echo "build-wheel: ${wheelhouse}/$(basename "${repaired}")"

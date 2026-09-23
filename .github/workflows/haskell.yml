@@ -2,13 +2,27 @@ name: Build and Test
 on:
   push:
     branches: ["main"]
+    tags: ["v*"]
   pull_request:
+  workflow_dispatch:
 
-# One job per (OS, CPython) pair builds the library, the Haskell suite and the
-# example extension module, then imports the module from that CPython and runs
-# the pytest suite against it.
-# GHC is fixed at 9.12.4, the version cabal.project.local pins; the matrix is
-# over the interpreter the module is built against, because the include
+permissions:
+  contents: read
+
+# A newer push to a pull request supersedes the running checks.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# One job per (platform, CPython) pair builds the library, the Haskell suite
+# and the example extension module, then imports the module from that CPython
+# and runs the pytest suite against it.
+# The platforms are every one a wheel is built for: x86_64 and aarch64 Linux,
+# Apple silicon and Intel macOS, including those a developer machine can test
+# itself, so that nothing rests on a local run alone.
+# GHC is fixed at 9.12.4 and cabal-install at 3.14.2.0, the versions of the
+# manylinux bindists; the Hackage index is pinned by cabal.project; the matrix
+# is over the interpreter the module is built against, because the include
 # directory of that interpreter is what scripts/configure-python.sh records.
 #
 # Linux notes, so that nobody guesses at them later:
@@ -20,13 +34,28 @@ on:
 # - The Haskell boot libraries of the ghcup bindist and the cabal store are
 #   built as shared objects, which is what a native-shared foreign library
 #   links against; ghc-bignum links the system libgmp.so.10 on Linux, so the
-#   runner needs libgmp (haskell-actions/setup installs it with GHC).
-# - scripts/gen-weakapi.sh is a macOS concern only: the weak references exist
-#   so that GHC can dlopen libHSh2py without an interpreter to run Template
-#   Haskell; on Linux undefined symbols in a shared object are already lazy.
-#   The `--check` step therefore runs on macOS alone.
-# - The wheel job below is macOS-only for now; the auditwheel branch of
-#   scripts/build-wheel.sh is written but has not been run in CI.
+#   runner needs libgmp-dev, which the Build and test job installs (the
+#   setup action does not, and the Arm images lack it).
+# - The CPython references of the library are weak on Linux as on macOS:
+#   GHC's loader binds calls lazily, but a function whose address the shim
+#   takes needs its symbol when GHC loads the library for Template Haskell,
+#   so the `--check` of scripts/gen-weakapi.sh runs on both.
+#
+# Wheels: each wheel job builds, repairs and checks one wheel with
+# scripts/build-wheel.sh (macOS) or scripts/manylinux-wheel.sh (inside the
+# manylinux_2_28 image, Linux), from a fresh tree, with a cabal store of its
+# own.  The test jobs install every wheel into clean interpreters, the oldest
+# and newest CPython the wheel claims from the runner and from uv's managed
+# builds, with no build tree around, and run the whole pytest suite against
+# it; the Linux wheels also in AlmaLinux 8, the oldest glibc their tag admits,
+# and in Debian 13, whose glibc 2.41 refuses executable stacks.
+# The wheels job collects the tested wheels into one artifact, and the CI job
+# fails unless every other job succeeded: require CI in branch protection (a
+# skipped job counts as passed there, so no job that can be skipped is fit).
+
+env:
+  ghc: "9.12.4"
+  cabal: "3.14.2.0"
 
 jobs:
   build:
@@ -34,13 +63,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-26, macos-15-intel]
         python: ["3.12", "3.13"]
     runs-on: ${{ matrix.os }}
-    env:
-      ghc: "9.12.4"
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install libgmp-dev
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q libgmp-dev
 
       - name: Set up Python ${{ matrix.python }}
         id: python
@@ -56,7 +88,7 @@ jobs:
         uses: haskell-actions/setup@v2
         with:
           ghc-version: ${{ env.ghc }}
-          cabal-version: latest
+          cabal-version: ${{ env.cabal }}
           cabal-update: true
 
       - name: Calculate cache keys
@@ -68,6 +100,7 @@ jobs:
             await script({ os: ${{ toJSON(matrix.os) }}, plan: "ghc-${{ env.ghc }}-py${{ matrix.python }}", path: "cabal.project", core, glob })
 
       - name: Restore the cabal store
+        id: store
         uses: actions/cache/restore@v4
         with:
           path: ${{ steps.haskell.outputs.cabal-store }}
@@ -95,12 +128,14 @@ jobs:
         run: cabal build --only-dependencies all
 
       - name: Save the cabal store
+        if: steps.store.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: ${{ steps.haskell.outputs.cabal-store }}
           key: ${{ steps.cache-keys.outputs.store }}
 
       - name: Build
+        id: build
         run: cabal build all
 
       - name: Save dist-newstyle
@@ -109,16 +144,23 @@ jobs:
           path: dist-newstyle
           key: ${{ steps.cache-keys.outputs.dist }}
 
+      # The checks below are independent of one another: each runs when the
+      # build succeeded, whatever became of the others.
       - name: Haskell test suite
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: cabal test all
 
       - name: Install the extension module
+        id: install
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: scripts/install-module.sh
 
       - name: Python test suite
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         run: PYTHONPATH="${PWD}/build" .venv/bin/python -m pytest -q h2py-examples/tests
 
       - name: Type stubs
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
         # The module renders its own stubs, a stub-only package because it
         # has submodules; mypy --strict must accept them, and they must match
         # the committed copy under h2py-examples/stubs (regenerate it with
@@ -128,37 +170,62 @@ jobs:
           .venv/bin/python -m mypy --strict build/h2py_examples-stubs
           .venv/bin/python scripts/h2py-stubs.py --path build --check h2py-examples/stubs h2py_examples
 
-      - name: Weak CPython references (macOS)
-        if: runner.os == 'macOS'
+      - name: Weak CPython references
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
         run: scripts/gen-weakapi.sh --check
 
-      - name: Multiplicity-error cases
-        # The script exists once h2py/test/typing-fail/ does; until then the
-        # step is a no-op rather than a guess at its interface.
-        run: |
-          if [ -x scripts/check-typing-fail.sh ]; then
-            scripts/check-typing-fail.sh
-          else
-            echo "scripts/check-typing-fail.sh not present; skipped"
-          fi
+      - name: Licence files of the wheel
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: >-
+          .venv/bin/python scripts/wheel-licenses.py --check
+          --licenses h2py-examples/python/third-party-licenses
+          --pyproject h2py-examples/python/pyproject.toml
+          flib:h2py_examples
 
-  wheel:
-    name: Wheel (macos-latest, Python 3.13)
-    runs-on: macos-latest
-    env:
-      ghc: "9.12.4"
+      - name: Licence texts of GHC's boot libraries
+        # A GHC installation puts GHC's own licence where every boot library's
+        # should be, so their sections are compared with GHC's source release.
+        if: ${{ !cancelled() && steps.build.outcome == 'success' && matrix.os == 'ubuntu-24.04' && matrix.python == '3.12' }}
+        run: |
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/ghc-src.tar.xz" "https://downloads.haskell.org/~ghc/${{ env.ghc }}/ghc-${{ env.ghc }}-src.tar.xz"
+          echo "02d1ee5080acf00e135b93b238f09015b06ff27254cde59669cf57c42c2bee43  ${RUNNER_TEMP}/ghc-src.tar.xz" | sha256sum -c -
+          tar -xJf "${RUNNER_TEMP}/ghc-src.tar.xz" -C "${RUNNER_TEMP}" --wildcards '*LICENSE*' '*.cabal' '*.cabal.in'
+          .venv/bin/python scripts/wheel-licenses.py --check --ghc-source "${RUNNER_TEMP}/ghc-${{ env.ghc }}" \
+            --licenses h2py-examples/python/third-party-licenses \
+            --pyproject h2py-examples/python/pyproject.toml flib:h2py_examples
+
+      - name: Multiplicity-error cases
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        run: scripts/check-typing-fail.sh
+
+  wheel-macos:
+    name: Wheel (macOS ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-26
+          # GitHub's Intel macOS images, macos-15-intel and macos-26-intel,
+          # are the last x86_64 ones and are offered until 2027.
+          - arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         id: python
         with:
-          python-version: "3.13"
+          # The oldest CPython the abi3 wheel claims; its headers are the ones
+          # the limited API at 3.12 is compiled against.
+          python-version: "3.12"
       - uses: astral-sh/setup-uv@v6
       - uses: haskell-actions/setup@v2
         id: haskell
         with:
           ghc-version: ${{ env.ghc }}
-          cabal-version: latest
+          cabal-version: ${{ env.cabal }}
           cabal-update: true
       - name: Calculate cache keys
         id: cache-keys
@@ -166,43 +233,244 @@ jobs:
         with:
           script: |
             const script = require('./ci/scripts/calc-cache-keys.js')
-            await script({ os: "macos-latest", plan: "ghc-${{ env.ghc }}-py3.13", path: "cabal.project", core, glob })
+            await script({ os: ${{ toJSON(matrix.runner) }}, plan: "wheel-ghc-${{ env.ghc }}", path: "cabal.project", core, glob })
       - name: Restore the cabal store
+        id: store
         uses: actions/cache/restore@v4
         with:
           path: ${{ steps.haskell.outputs.cabal-store }}
           key: ${{ steps.cache-keys.outputs.store }}
           restore-keys: ${{ steps.cache-keys.outputs.store-restore }}
       - name: Create the Python environment
+        # build-wheel.sh installs the wheel tools into it from the hash-pinned
+        # h2py-examples/python/build-requirements.txt.
+        run: uv venv --python "${{ steps.python.outputs.python-path }}" .venv
+      - name: Build the dependencies
         run: |
-          uv venv --python "${{ steps.python.outputs.python-path }}" .venv
-          uv pip install --python .venv/bin/python build hatchling delocate
-      - name: Build, repair and verify the wheel
-        # build-wheel.sh runs configure-python.sh and cabal build itself, then
-        # delocate-wheel, then installs the wheel into a throwaway venv and
-        # imports it.  MACOSX_DEPLOYMENT_TARGET keeps the platform tag of the
-        # libraries built here from exceeding the runner's own version.
-        env:
-          MACOSX_DEPLOYMENT_TARGET: "14.0"
+          scripts/configure-python.sh .venv/bin/python
+          cabal build --only-dependencies h2py-examples
+      - name: Save the cabal store
+        if: steps.store.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.haskell.outputs.cabal-store }}
+          key: ${{ steps.cache-keys.outputs.store }}
+      - name: Build, repair and check the wheel
+        # build-wheel.sh runs configure-python.sh and cabal build itself, with
+        # nothing of the local packages built before (no dist-newstyle cache is
+        # restored), so no object predates the deployment target cabal.project
+        # sets; then delocate-wheel, the licence check of the repaired wheel,
+        # and a check of the wheel installed in a fresh venv.
         run: scripts/build-wheel.sh .venv/bin/python
       - uses: actions/upload-artifact@v4
         with:
-          name: h2py-examples-wheel-macos
+          name: wheel-macos-${{ matrix.arch }}
           path: build/wheelhouse/*.whl
-          retention-days: 7
+          if-no-files-found: error
+          retention-days: 14
+
+  wheel-linux:
+    name: Wheel (manylinux_2_28 ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # The manylinux image is pinned (a job's container cannot read the
+        # workflow's env); the gmp it ships is checked against the GMP notice
+        # by scripts/manylinux-wheel.sh.
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            image: quay.io/pypa/manylinux_2_28_x86_64:2026.09.14-1
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            image: quay.io/pypa/manylinux_2_28_aarch64:2026.09.14-1
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    timeout-minutes: 120
+    env:
+      CABAL_DIR: /opt/cabal
+    steps:
+      - uses: actions/checkout@v4
+      - name: Calculate cache keys
+        id: cache-keys
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const script = require('./ci/scripts/calc-cache-keys.js')
+            await script({ os: ${{ toJSON(matrix.image) }}, plan: "wheel-ghc-${{ env.ghc }}", path: "cabal.project", core, glob })
+      - name: Restore the cabal store
+        id: store
+        uses: actions/cache/restore@v4
+        with:
+          path: /opt/cabal/store
+          key: ${{ steps.cache-keys.outputs.store }}
+          restore-keys: ${{ steps.cache-keys.outputs.store-restore }}
+      - name: Build the dependencies
+        # Installs the pinned GHC and cabal-install bindists (glibc 2.28) and
+        # builds the Haskell dependencies into the store.
+        run: scripts/manylinux-wheel.sh --deps-only
+      - name: Save the cabal store
+        if: steps.store.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /opt/cabal/store
+          key: ${{ steps.cache-keys.outputs.store }}
+      - name: Build, repair and check the wheel
+        # Runs scripts/build-wheel.sh with the image's CPython 3.12; auditwheel
+        # bundles the Haskell libraries, libgmp and libffi.
+        run: scripts/manylinux-wheel.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-${{ matrix.arch }}
+          path: build/wheelhouse-manylinux_2_28_${{ matrix.arch }}/*.whl
+          if-no-files-found: error
+          retention-days: 14
+
+  test-wheels-macos:
+    name: Test wheel (macOS ${{ matrix.arch }}, Python ${{ matrix.python }})
+    needs: wheel-macos
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.14"]
+        arch: [arm64, x86_64]
+        include:
+          - arch: arm64
+            runner: macos-26
+          - arch: x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-macos-${{ matrix.arch }}
+          path: wheels
+      - name: Test the wheel
+        run: scripts/test-wheel.sh "${{ steps.python.outputs.python-path }}" "macosx_11_0_${{ matrix.arch }}" wheels
+      - name: Test the wheel with a uv-managed CPython
+        if: ${{ !cancelled() }}
+        run: scripts/test-wheel.sh "uv:${{ matrix.python }}" "macosx_11_0_${{ matrix.arch }}" wheels
+
+  test-wheels-linux:
+    name: Test wheel (Linux ${{ matrix.arch }}, Python ${{ matrix.python }})
+    needs: wheel-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.14"]
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-linux-${{ matrix.arch }}
+          path: wheels
+      - name: Test the wheel
+        run: scripts/test-wheel.sh "${{ steps.python.outputs.python-path }}" "manylinux_2_28_${{ matrix.arch }}" wheels
+      - name: Test the wheel with a uv-managed CPython
+        if: ${{ !cancelled() }}
+        run: scripts/test-wheel.sh "uv:${{ matrix.python }}" "manylinux_2_28_${{ matrix.arch }}" wheels
+
+  test-wheels-glibc:
+    name: Test wheel (${{ matrix.image }} ${{ matrix.arch }})
+    needs: wheel-linux
+    strategy:
+      fail-fast: false
+      matrix:
+        # AlmaLinux 8 has the oldest glibc the wheel's tag admits (2.28), with
+        # the distribution's own CPython 3.12 and nothing else installed;
+        # Debian 13 (python:3.14-slim) has glibc 2.41, which refuses libraries
+        # that ask for an executable stack.
+        image: ["almalinux:8", "python:3.14-slim"]
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - image: "almalinux:8"
+            python: /usr/bin/python3.12
+          - image: "python:3.14-slim"
+            python: /usr/local/bin/python3.14
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.image }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheel-linux-${{ matrix.arch }}
+          path: wheels
+      - name: Install CPython 3.12
+        if: matrix.image == 'almalinux:8'
+        run: dnf install -y python3.12
+      - name: Test the wheel
+        run: scripts/test-wheel.sh "${{ matrix.python }}" "manylinux_2_28_${{ matrix.arch }}" wheels
+
+  wheels:
+    name: Wheels
+    needs: [test-wheels-macos, test-wheels-linux, test-wheels-glibc]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: wheels
+          merge-multiple: true
+      - name: List the wheels and their checksums
+        run: |
+          cd wheels
+          ls -l
+          test "$(ls *.whl | wc -l)" -eq 4
+          for platform in macosx_11_0_arm64 macosx_11_0_x86_64 manylinux_2_28_x86_64 manylinux_2_28_aarch64; do
+            ls *-cp312-abi3-"${platform}".whl
+          done
+          sha256sum *.whl > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: wheels/
+          if-no-files-found: error
+          retention-days: 30
 
   fourmolu:
     name: Fourmolu
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: fourmolu/fourmolu-action@v13
         with:
+          # The version the maintainer's editor hooks format with; a newer one
+          # orders some imports differently.
+          version: "0.20.0.0"
           # fourmolu reads default-extensions from library stanzas only, not
           # from the foreign-library of h2py-examples, so that stanza's
-          # extensions (and GHC2021's ImportQualifiedPost) are passed by hand;
-          # they are harmless for the files that already declare them.
-          extra-args: "-o -XImportQualifiedPost -o -XLinearTypes -o -XQualifiedDo -o -XBlockArguments -o -XDataKinds -o -XTypeOperators -o -XLambdaCase -o -XOverloadedStrings -o -XDerivingStrategies -o -XExplicitNamespaces"
+          # extensions (and GHC2021's ImportQualifiedPost and BangPatterns) are
+          # passed by hand; they are harmless for the files that already
+          # declare them.
+          extra-args: "-o -XImportQualifiedPost -o -XLinearTypes -o -XQualifiedDo -o -XBlockArguments -o -XDataKinds -o -XTypeOperators -o -XLambdaCase -o -XOverloadedStrings -o -XDerivingStrategies -o -XExplicitNamespaces -o -XBangPatterns"
           pattern: |
             **/*.hs
             !**/Setup.hs
@@ -210,12 +478,29 @@ jobs:
 
   cabal-check:
     name: Cabal check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: haskell-actions/setup@v2
         with:
-          ghc-version: "9.12.4"
-          cabal-version: latest
+          ghc-version: ${{ env.ghc }}
+          cabal-version: ${{ env.cabal }}
           cabal-update: false
       - run: bash ./ci/scripts/cabal-check-packages.sh
+
+  ci:
+    name: CI
+    # The one check to require: it runs whatever became of the others and
+    # fails unless every one of them succeeded.
+    if: ${{ always() }}
+    needs: [build, wheel-macos, wheel-linux, test-wheels-macos, test-wheels-linux, test-wheels-glibc, wheels, fourmolu, cabal-check]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Every job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "results: ${RESULTS}"
+          for r in ${RESULTS}; do [ "${r}" = success ] || exit 1; done

@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
-# Build everything, run the Haskell suite, check the weak references, install
-# the module, run the Python suite, and check the rendered stubs against the
-# committed copy; the typing-fail check runs when present.
+# Build everything, run the Haskell suite, check the weak references and the
+# licence files of the wheel, install the module, run the Python suite, and
+# check the rendered stubs against the committed copy; the typing-fail check
+# runs when present.
 set -euo pipefail
 root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${root}"
 cabal build all
 cabal test all
-if [ "$(uname -s)" = Darwin ]; then
-  scripts/gen-weakapi.sh --check
-fi
+scripts/gen-weakapi.sh --check
+"${root}/.venv/bin/python" scripts/wheel-licenses.py --check \
+  --licenses h2py-examples/python/third-party-licenses \
+  --pyproject h2py-examples/python/pyproject.toml flib:h2py_examples
 if [ -x scripts/check-typing-fail.sh ]; then
   scripts/check-typing-fail.sh
 fi

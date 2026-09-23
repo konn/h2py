@@ -196,8 +196,8 @@ test-suite h2py-inspection
 
 -- Guards the invariant that lets GHC load the library for Template Haskell
 -- with no interpreter in the process (see include/h2py/weakapi.h): no CPython
--- data symbol is referenced from the shim, and on macOS every CPython
--- reference of the built library is weak and listed in weakapi.h.
+-- data symbol is referenced from the shim, and on macOS and Linux every
+-- CPython reference of the built library is weak and listed in weakapi.h.
 test-suite h2py-weakcheck
   import: defaults
   type: exitcode-stdio-1.0

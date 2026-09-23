@@ -7,13 +7,19 @@ module.exports = async ({ os, plan, path, core, glob }) => {
 
     return { key: comps.join("-"), restore: fallbacks.join("\n") };
   }
-  const project_hash = await glob.hashFiles("cabal.project", path);
+  // @actions/glob's hashFiles takes one pattern string, patterns separated by
+  // newlines; a second argument is the workspace, not another pattern, and
+  // would make every file fall outside it and the hash come out empty.
+  const hash = (patterns) =>
+    glob.hashFiles(patterns.concat(["!dist-newstyle/**"]).join("\n"));
+
+  const project_hash = await hash([path]);
   core.setOutput("project", project_hash);
 
-  const package_hash = await glob.hashFiles("**/*.cabal");
+  const package_hash = await hash(["**/*.cabal"]);
   core.setOutput("package", package_hash);
 
-  const source_hash = await glob.hashFiles(
+  const source_hash = await hash([
     "**/*.hs",
     "**/*.lhs",
     "**/*.hsig",
@@ -21,8 +27,8 @@ module.exports = async ({ os, plan, path, core, glob }) => {
     "**/*.c",
     "**/*.h",
     "**/*.chs",
-    "**/*.hsc"
-  );
+    "**/*.hsc",
+  ]);
   core.setOutput("source", source_hash);
 
   const store_prefix = `store-${os}-${plan}`;

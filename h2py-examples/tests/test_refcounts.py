@@ -2,7 +2,12 @@
 
 Every check is a delta of ``sys.getrefcount`` around the call: arguments come
 back to their count on success, on a Left and on a Haskell-exception path,
-and a fresh result carries exactly the one reference its local holds.
+and a fresh result carries exactly the one reference its local holds, which
+is checked against a fresh Python object held the same way, in the same
+frame: CPython 3.14 passes a local to a call, and even binds it to a
+parameter, without a new reference, so the count ``rc`` reports for it is one
+lower than up to 3.13 and a helper taking the object as an argument cannot
+measure it.
 Fresh, non-immortal objects are used throughout, since small integers, None
 and interned strings have no observable count.
 """
@@ -62,7 +67,8 @@ def stable(fn, *args, expect=None):
 def fresh_result(fn, *args):
     """The result of fn is a fresh object referenced only by the local that holds it."""
     r = fn(*args)
-    assert rc(r) == 2
+    fresh = object()
+    assert rc(r) == rc(fresh)
     return r
 
 
@@ -184,7 +190,8 @@ def test_roundtrip_arguments_and_results(fn, value):
     r = stable(fn, value)
     # A one-character str is a CPython singleton and has no observable count.
     if not (isinstance(r, str) and len(r) == 1):
-        assert rc(r) == 2
+        fresh = object()
+        assert rc(r) == rc(fresh)
     # The items of a container argument are not retained either.
     if isinstance(value, (list, tuple)):
         for item in value:
@@ -375,7 +382,8 @@ def test_constructors(fn, value, expected):
     assert r == expected
     assert type(r) is type(expected)
     if r is not True:
-        assert rc(r) == 2
+        fresh = object()
+        assert rc(r) == rc(fresh)
 
 
 def test_none_and_empty_tuple():
@@ -384,7 +392,8 @@ def test_none_and_empty_tuple():
     assert ops.new_dict() == {}
     assert ops.new_list() == []
     r = ops.new_list()
-    assert rc(r) == 2
+    fresh = object()
+    assert rc(r) == rc(fresh)
 
 
 def test_containers_from_iterables():

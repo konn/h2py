@@ -47,6 +47,13 @@ int h2py_runtime_init(void);
  * the generated module exec slot; returns 0, or -1 with an exception set. */
 int h2py_runtime_register_hooks(PyObject *module);
 
+/* 0 when the interpreter defines every CPython function the library
+ * references weakly; otherwise -1, with an ImportError naming the missing
+ * ones set when the interpreter can raise it.  Called first by the PyInit_
+ * (and PyModExport_) function of <h2py/init.h>, before CPython sees the
+ * module definition. */
+int h2py_check_cpython_symbols(void);
+
 /* Non-zero once the interpreter is finalising (Py_IsFinalizing where the
  * limited API has it, and always the atexit flag), or after an os.fork() in
  * the child, where the RTS is unusable. */

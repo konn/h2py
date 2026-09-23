@@ -1,0 +1,52 @@
+GMP, the GNU Multiple Precision Arithmetic Library
+==================================================
+
+The GHC runtime in this wheel uses GMP for arbitrary-precision integers,
+through the gmp backend of the ghc-bignum library.
+
+- The macOS wheels contain GMP 6.3.0 compiled into the shared library
+  libHSghc-bignum in the h2py_examples.dylibs directory of the wheel, as
+  GHC 9.12.4's release build of ghc-bignum contains it.
+- The Linux wheels contain GMP as the separate shared library libgmp.so.10
+  in the h2py_examples.libs directory of the wheel, renamed by auditwheel.
+  It is the gmp 6.1.2-11.el8 package of AlmaLinux 8.10, the base of the
+  manylinux_2_28 image the wheels are built in.
+
+Copyright 1991, 1996, 1999, 2000, 2007 Free Software Foundation, Inc.
+
+The GNU MP Library is free software; you can redistribute it and/or modify
+it under the terms of either the GNU Lesser General Public License as
+published by the Free Software Foundation, either version 3 of the License
+or any later version, or the GNU General Public License as published by the
+Free Software Foundation, either version 2 of the License or any later
+version.
+This wheel conveys GMP under the GNU Lesser General Public License version 3,
+whose text is in LGPL-3.0.txt, together with the GNU General Public License
+version 3 it supplements, in GPL-3.0.txt.
+
+The GNU MP Library is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+or FITNESS FOR A PARTICULAR PURPOSE.
+
+Corresponding source
+--------------------
+
+macOS wheels:
+- GMP 6.3.0: https://gmplib.org/download/gmp/gmp-6.3.0.tar.xz, and inside
+  GHC's source release, ghc-9.12.4-src.tar.xz, as
+  libraries/ghc-bignum/gmp/gmp-tarballs/gmp-6.3.0-nodoc.tar.xz, together
+  with the build scripts GHC applies.
+- ghc-bignum, which contains GMP there, with the rest of the GHC runtime:
+  https://downloads.haskell.org/ghc/9.12.4/ghc-9.12.4-src.tar.xz, under
+  libraries/ghc-bignum.
+  Rebuilding libHSghc-bignum from it against a modified GMP and putting it in
+  place of the one in the wheel relinks the rest of the wheel against the
+  modified GMP, since every other library loads it dynamically.
+
+Linux wheels:
+- The source package of the bundled library, with AlmaLinux's patches:
+  https://vault.almalinux.org/8.10/BaseOS/Source/Packages/gmp-6.1.2-11.el8.src.rpm
+- The upstream release it is built from:
+  https://gmplib.org/download/gmp/gmp-6.1.2.tar.xz
+  The library is loaded dynamically, so a modified, interface-compatible
+  libgmp.so.10 can be put in its place.

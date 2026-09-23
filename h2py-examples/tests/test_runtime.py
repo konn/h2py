@@ -63,7 +63,11 @@ def test_refcount_on_error_paths():
 def test_result_refcount():
     c = m.Counter(7)
     s = c.label()
-    assert sys.getrefcount(s) == 2
+    # Only the local holds the result, so it counts as a fresh object held by
+    # one local does: 2 up to CPython 3.13 and 1 from 3.14, which passes a
+    # local to a call without a new reference.
+    fresh = object()
+    assert sys.getrefcount(s) == sys.getrefcount(fresh)
 
 
 def test_call_overhead_is_bounded():

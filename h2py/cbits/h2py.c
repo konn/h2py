@@ -2,6 +2,9 @@
  * The H2Py shim.  See include/h2py/h2py.h for the contract of each function
  * and docs/H2Py-DESIGN.md, sections 5.1 to 5.4 and 5.7, for the design.
  */
+/* This translation unit holds the table of weak CPython references that
+ * h2py_check_cpython_symbols walks; see weakapi.h. */
+#define H2PY_WEAKAPI_TABLE
 #include <h2py/h2py.h>
 
 #include <pthread.h>
@@ -184,6 +187,49 @@ static void h2py_arena_pop(h2py_arena *arena)
     free(arena);
 }
 
+/* The lowest address of this thread's stack, found on the thread's first
+ * call and kept, since a thread's stack does not move.  Asking every time was
+ * the dominant cost of a call on Linux: glibc answers pthread_getattr_np for
+ * the initial thread by reading /proc/self/maps and querying the stack
+ * rlimit, a few hundred microseconds against about one for the rest of the
+ * call.  The state is 0 while the bound is unknown, 1 once it is known, and
+ * -1 where the platform has no way to tell, which disables the check.
+ * A failed lookup (glibc's needs a file descriptor for the initial thread) is
+ * not remembered, so the next call asks again, as every call did before.
+ * The initial thread's stack grows up to the stack rlimit, which glibc reads
+ * at the lookup: h2py_call_begin looks again before refusing a call for lack
+ * of room, so a limit raised after the first call is honoured, while one
+ * lowered after it is not seen, as CPython 3.14 does not see it for its own
+ * stack check either; seeing it would cost a system call per call. */
+static _Thread_local char *h2py_tls_stack_low = NULL;
+static _Thread_local int h2py_tls_stack_state = 0;
+
+static void h2py_stack_find_low(void)
+{
+#if defined(__APPLE__)
+    pthread_t self = pthread_self();
+    char *top = (char *) pthread_get_stackaddr_np(self);
+    size_t size = pthread_get_stacksize_np(self);
+    h2py_tls_stack_low = top - size;
+    h2py_tls_stack_state = 1;
+#elif defined(__linux__)
+    pthread_attr_t attr;
+    void *base = NULL;
+    size_t size = 0;
+    if (pthread_getattr_np(pthread_self(), &attr) != 0) {
+        return;
+    }
+    int rc = pthread_attr_getstack(&attr, &base, &size);
+    pthread_attr_destroy(&attr);
+    if (rc == 0 && base != NULL) {
+        h2py_tls_stack_low = (char *) base;
+        h2py_tls_stack_state = 1;
+    }
+#else
+    h2py_tls_stack_state = -1;
+#endif
+}
+
 /* The C stack left below the current frame on this thread, or -1 if it cannot
  * be determined.  Every trampoline entry re-enters the RTS on the calling OS
  * thread with a stack reservation of its own, so a Python recursion that
@@ -191,28 +237,13 @@ static void h2py_arena_pop(h2py_arena *arena)
  * recursion accounting assumes. */
 static long h2py_stack_headroom(void)
 {
-#if defined(__APPLE__)
-    pthread_t self = pthread_self();
-    char *top = (char *) pthread_get_stackaddr_np(self);
-    size_t size = pthread_get_stacksize_np(self);
-    char *here = (char *) __builtin_frame_address(0);
-    return (long) (here - (top - size));
-#elif defined(__linux__)
-    pthread_attr_t attr;
-    void *base = NULL;
-    size_t size = 0;
-    if (pthread_getattr_np(pthread_self(), &attr) != 0) {
+    if (h2py_tls_stack_state == 0) {
+        h2py_stack_find_low();
+    }
+    if (h2py_tls_stack_state != 1) {
         return -1;
     }
-    int rc = pthread_attr_getstack(&attr, &base, &size);
-    pthread_attr_destroy(&attr);
-    if (rc != 0 || base == NULL) {
-        return -1;
-    }
-    return (long) ((char *) __builtin_frame_address(0) - (char *) base);
-#else
-    return -1;
-#endif
+    return (long) ((char *) __builtin_frame_address(0) - h2py_tls_stack_low);
 }
 
 /* What a call needs below its entry: the RTS reservation, the scheduler and
@@ -228,6 +259,20 @@ h2py_arena *h2py_call_begin(void)
         return NULL;
     }
     long room = h2py_stack_headroom();
+    if (room >= 0 && room < H2PY_STACK_MIN && h2py_tls_stack_state == 1) {
+        /* Look again before refusing: the stack rlimit may have been raised
+         * since the bound was found.  If the lookup fails, the bound already
+         * found stands, and the call is refused. */
+        char *known = h2py_tls_stack_low;
+        h2py_tls_stack_state = 0;
+        long again = h2py_stack_headroom();
+        if (h2py_tls_stack_state == 1) {
+            room = again;
+        } else {
+            h2py_tls_stack_low = known;
+            h2py_tls_stack_state = 1;
+        }
+    }
     if (room >= 0 && room < H2PY_STACK_MIN) {
         PyErr_SetString(h2py_exception_type(24),
                         "maximum recursion depth exceeded through a Haskell call");
@@ -792,6 +837,59 @@ PyObject *h2py_exception_type(int which)
         h2py_exception_cache[which] = h2py_builtin(h2py_exception_names[which]);
     }
     return h2py_exception_cache[which];
+}
+
+/* Every CPython function the library references is a weak reference (see
+ * weakapi.h), so on an interpreter that lacks one the first use would call
+ * address 0.  The module's exec slot calls this first, and a missing function
+ * fails the import with an ImportError that names it.  If even the functions
+ * that raise it are missing, it returns -1 with no exception set, which
+ * CPython reports as a SystemError. */
+int h2py_check_cpython_symbols(void)
+{
+    char missing[512] = "";
+    size_t used = 0;
+    int count = 0;
+    int truncated = 0;
+    for (size_t i = 0; i < sizeof h2py_weakapi_table / sizeof h2py_weakapi_table[0]; i++) {
+        if (h2py_weakapi_table[i].address != NULL) {
+            continue;
+        }
+        count++;
+        if (truncated) {
+            continue;
+        }
+        /* Keep room for ", ..." should a later name not fit. */
+        int n = snprintf(missing + used, sizeof missing - used - 5, "%s%s", count > 1 ? ", " : "",
+                         h2py_weakapi_table[i].name);
+        if (n > 0 && (size_t) n < sizeof missing - used - 5) {
+            used += (size_t) n;
+        } else {
+            missing[used] = '\0';
+            strcat(missing, ", ...");
+            truncated = 1;
+        }
+    }
+    if (count == 0) {
+        return 0;
+    }
+    const void *raise_with[] = {(const void *) &PyErr_SetString, (const void *) &PyImport_ImportModule,
+                                (const void *) &PyObject_GetAttrString};
+    for (size_t i = 0; i < sizeof raise_with / sizeof raise_with[0]; i++) {
+        if (raise_with[i] == NULL) {
+            return -1;
+        }
+    }
+    PyObject *import_error = h2py_exception_type(19);
+    if (import_error != NULL) {
+        char message[640];
+        snprintf(message, sizeof message,
+                 "H2Py: this interpreter lacks CPython functions the module needs (%s); "
+                 "H2Py modules need CPython 3.12 or later",
+                 missing);
+        PyErr_SetString(import_error, message);
+    }
+    return -1;
 }
 
 PyObject *h2py_none(void) { H2PY_CACHED(c, h2py_builtin("None")); }
