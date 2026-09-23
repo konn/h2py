@@ -71,11 +71,16 @@ def test_result_refcount():
 
 
 def test_call_overhead_is_bounded():
-    n = 20000
-    t0 = time.perf_counter()
-    for _ in range(n):
-        m.add(1, 2)
-    per_call = (time.perf_counter() - t0) / n
+    # The best of five batches, so that a stall of the machine in one batch
+    # does not count as the cost of a call.
+    n = 4000
+    batches = []
+    for _ in range(5):
+        t0 = time.perf_counter()
+        for _ in range(n):
+            m.add(1, 2)
+        batches.append((time.perf_counter() - t0) / n)
+    per_call = min(batches)
     # A generous bound: the design targets coarse-grained calls, but a call
     # must not cost more than a few tens of microseconds.
     assert per_call < 50e-6, f"{per_call * 1e6:.1f} us per call"

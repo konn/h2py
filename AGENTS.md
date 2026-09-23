@@ -110,3 +110,5 @@ Findings are fixed or rebutted in writing; a soundness or ownership finding is n
 - "Must not typecheck" cases live in `TypingCases` modules compiled with `-fdefer-type-errors -Wno-deferred-type-errors` and are forced at runtime; multiplicity errors, which GHC does not defer, live under `h2py/test/typing-fail/` and are checked by `scripts/check-typing-fail.sh`.
 - Refcount deltas are asserted from Python with `sys.getrefcount`, including on `Left` and Haskell-exception paths.
 - `expectFailBecause` only for properties we want and do not yet have.
+- A concurrency test never sleeps a fixed time for another thread to reach a state: it polls for the state it checks, with a probe that changes nothing when it gets through, or joins the thread.
+  A bound on time is used only where the property is about time, and then far from both the expected and the failing value; the pytest suite runs about 26 times per push, on loaded runners.
