@@ -1,17 +1,25 @@
-"""The hatchling build hook of the ``h2py-examples`` wheel.
+"""The hatchling build hook of an H2Py extension wheel, here ``h2py-examples``.
 
 Building the wheel means building the Haskell extension module, so the hook
-drives ``cabal`` from the repository root (two directories up) and then puts
-the extension and its stubs at the top level of the wheel:
+drives ``cabal`` from the root of the Cabal project, the nearest directory up
+from this one with a ``cabal.project``, and then puts the extension and its
+stubs at the top level of the wheel:
 
-- ``h2py_examples.abi3.so``: the ``foreign-library`` that Cabal built, renamed
-  to the file name CPython imports (a ``.so`` on macOS too, as CPython
-  expects);
+- ``<module>.abi3.so``: the ``foreign-library`` that Cabal built, renamed to
+  the file name CPython imports (a ``.so`` on macOS too, as CPython expects);
 - the type stubs, written by ``scripts/h2py-stubs.py`` after importing the
-  built module once in a subprocess: the stub-only package
-  ``h2py_examples-stubs/`` (``__init__.pyi``, one ``.pyi`` per submodule and
-  ``py.typed``) that PEP 561 gives to a module with submodules, or
-  ``h2py_examples.pyi`` and ``py.typed`` for a module without any.
+  built module once in a subprocess: the stub-only package ``<module>-stubs/``
+  (``__init__.pyi``, one ``.pyi`` per submodule, and ``py.typed``), which is
+  where type checkers look for the stubs of an installed single-file module,
+  whether or not it has submodules.
+
+Which module, foreign library and Cabal package those are comes from the
+``[tool.h2py]`` table of ``pyproject.toml``, which ``scripts/wheel-config.py``
+resolves (its docstring lists the keys and their defaults), and the scripts
+the hook runs are those under ``scripts/`` at the project root.
+A project of one's own copies this file and those scripts; the "Shipping
+wheels" section of ``docs/tutorial.md`` in the H2Py repository walks through
+it.
 
 The wheel is tagged ``cp312-abi3-<platform>`` because the module is built
 against the limited API at 3.12 (``Py_LIMITED_API = 0x030C0000``).
@@ -36,9 +44,10 @@ by absolute ``@rpath`` entries; ``scripts/build-wheel.sh`` runs
 
 Environment variables:
 
-- ``H2PY_MODULE`` (default ``h2py_examples``): the module to package.
 - ``H2PY_ABI`` (default ``abi3``): ``abi3`` or ``abi3t``, which selects the
   extension suffix and the wheel tag.
+- ``H2PY_CABAL_PACKAGES``: passed on to ``scripts/configure-python.sh``, with
+  the wheel's Cabal package added.
 - ``H2PY_SKIP_CABAL``: when set, the hook does not run ``cabal build`` and
   packages whatever ``dist-newstyle`` already holds.
 - ``MACOSX_DEPLOYMENT_TARGET``: must agree with ``cabal.project`` when set;
@@ -47,6 +56,7 @@ Environment variables:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -66,19 +76,23 @@ class H2PyBuildHook(BuildHookInterface):  # type: ignore[type-arg]
         if self.target_name != "wheel":
             return
 
-        module = os.environ.get("H2PY_MODULE", "h2py_examples")
         abi = os.environ.get("H2PY_ABI", "abi3")
         if abi not in ("abi3", "abi3t"):
             raise ValueError(f"H2PY_ABI must be abi3 or abi3t, not {abi!r}")
 
         python_dir = Path(self.root).resolve()
-        repo = python_dir.parent.parent
+        repo = _project_root(python_dir)
         scripts = repo / "scripts"
-        if not (scripts / "configure-python.sh").is_file():
+        wanted = ("configure-python.sh", "wheel-config.py", "h2py-stubs.py", "wheel-licenses.py")
+        missing = [name for name in wanted if not (scripts / name).is_file()]
+        if missing:
             raise RuntimeError(
-                f"{python_dir} is not inside a checkout of the h2py repository; "
-                "the wheel can only be built from one"
+                f"{scripts} lacks {', '.join(missing)}; copy them from the scripts/ directory of the H2Py repository"
             )
+        config = _config(scripts, python_dir / "pyproject.toml")
+        module = config["module"]
+        flib = config["foreign-library"]
+        package = config["cabal-package"]
 
         stage = python_dir / "build" / "stage"
         if stage.exists():
@@ -86,13 +100,19 @@ class H2PyBuildHook(BuildHookInterface):  # type: ignore[type-arg]
         stage.mkdir(parents=True)
 
         if not os.environ.get("H2PY_SKIP_CABAL"):
-            self.app.display_info(f"h2py: configuring for {sys.executable}")
-            _run([str(scripts / "configure-python.sh"), sys.executable], cwd=repo)
-            self.app.display_info("h2py: cabal build h2py-examples")
-            _run(["cabal", "build", "h2py-examples"], cwd=repo)
+            self.app.display_info(f"h2py: configuring {package} for {sys.executable}")
+            packages = f"{os.environ.get('H2PY_CABAL_PACKAGES', '')} {package}".strip()
+            _run(
+                [str(scripts / "configure-python.sh"), sys.executable],
+                cwd=repo,
+                env={**os.environ, "H2PY_CABAL_PACKAGES": packages},
+            )
+            target = f"{package}:flib:{flib}"
+            self.app.display_info(f"h2py: cabal build {target}")
+            _run(["cabal", "build", target], cwd=repo)
 
-        built = _find_built_library(repo, module)
-        _check_licences(repo, scripts, python_dir, module)
+        built = _find_built_library(repo, flib)
+        _check_licences(repo, scripts, python_dir, flib)
         ext_name = f"{module}.{abi}.so"
         ext_path = stage / ext_name
         shutil.copy2(built, ext_path)
@@ -111,13 +131,33 @@ class H2PyBuildHook(BuildHookInterface):  # type: ignore[type-arg]
             force_include[str(path)] = path.relative_to(stage).as_posix()
 
 
-def _run(cmd: list[str], cwd: Path) -> None:
-    subprocess.run(cmd, cwd=str(cwd), check=True)
+def _run(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
+    subprocess.run(cmd, cwd=str(cwd), env=env, check=True)
 
 
-def _find_built_library(repo: Path, module: str) -> Path:
+def _project_root(python_dir: Path) -> Path:
+    """The Cabal project the wheel is built from: the nearest directory up with a ``cabal.project``."""
+    for directory in (python_dir, *python_dir.parents):
+        if (directory / "cabal.project").is_file():
+            return directory
+    raise RuntimeError(f"no cabal.project in {python_dir} or above it; the wheel is built from a Cabal project")
+
+
+def _config(scripts: Path, pyproject: Path) -> dict[str, Any]:
+    """The ``[tool.h2py]`` settings of this wheel, resolved by ``scripts/wheel-config.py``."""
+    out = subprocess.run(
+        [sys.executable, str(scripts / "wheel-config.py"), "--json", str(pyproject)],
+        stdout=subprocess.PIPE,
+        text=True,
+        check=True,
+    )
+    config: dict[str, Any] = json.loads(out.stdout)
+    return config
+
+
+def _find_built_library(repo: Path, flib: str) -> Path:
     ext = "dylib" if sys.platform == "darwin" else "so"
-    name = f"lib{module}.{ext}"
+    name = f"lib{flib}.{ext}"
     candidates = [p for p in (repo / "dist-newstyle").rglob(name) if p.is_file()]
     if not candidates:
         raise RuntimeError(f"{name} not found under {repo / 'dist-newstyle'}; did cabal build fail?")
@@ -128,9 +168,11 @@ def _find_built_library(repo: Path, module: str) -> Path:
 def _write_stubs(scripts: Path, stage: Path, module: str) -> list[Path]:
     """Write the stubs of the staged module with ``scripts/h2py-stubs.py``.
 
-    The script imports the module and writes the same files the command line
-    does (``<module>-stubs/`` with submodules, ``<module>.pyi`` without), next
-    to the staged extension; the paths written are returned.
+    The script imports the module and writes the stub-only package
+    ``<module>-stubs/`` next to the staged extension (``--stub-package``, so
+    that a module without submodules gets it too: mypy does not read a
+    ``<module>.pyi`` beside an installed extension); the paths written are
+    returned.
     A subprocess, because the module starts a GHC runtime that is never shut
     down, and because the build interpreter must not keep the module loaded
     while the wheel is being written.
@@ -144,6 +186,7 @@ def _write_stubs(scripts: Path, stage: Path, module: str) -> list[Path]:
             str(stage),
             "--output",
             str(stage),
+            "--stub-package",
             module,
         ],
         cwd=str(stage),
@@ -159,7 +202,7 @@ def _files_under(root: Path) -> set[Path]:
     return {p for p in root.rglob("*") if p.is_file()}
 
 
-def _check_licences(repo: Path, scripts: Path, python_dir: Path, module: str) -> None:
+def _check_licences(repo: Path, scripts: Path, python_dir: Path, flib: str) -> None:
     """Fail the build when a library the module links in has no licence file."""
     _run(
         [
@@ -172,7 +215,7 @@ def _check_licences(repo: Path, scripts: Path, python_dir: Path, module: str) ->
             str(python_dir / "third-party-licenses"),
             "--pyproject",
             str(python_dir / "pyproject.toml"),
-            f"flib:{module}",
+            f"flib:{flib}",
         ],
         cwd=repo,
     )

@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
-# Build the h2py-examples wheel, bundle the Haskell runtime libraries into it,
-# and verify it in a fresh virtual environment.
+# Build the wheel of an H2Py extension module, h2py-examples unless
+# H2PY_PACKAGE_DIR names another, bundle the Haskell runtime libraries into
+# it, and verify it in a fresh virtual environment.
 #
-# 1. `python -m build --wheel h2py-examples/python` runs the hatchling hook
-#    (h2py-examples/python/hatch_build.py), which runs cabal, renames the
-#    foreign library to h2py_examples.abi3.so, writes the stub package
-#    h2py_examples-stubs/ with scripts/h2py-stubs.py, and tags the wheel
-#    cp312-abi3-<platform>.
+# The packaging directory holds the wheel's pyproject.toml, whose [tool.h2py]
+# table names the module, its foreign library and its Cabal package
+# (scripts/wheel-config.py lists the keys and their defaults), the hatchling
+# hook hatch_build.py, build-requirements.txt (the build tools, locked with
+# hashes) and the licence files.
+#
+# 1. `python -m build --wheel <packaging directory>` runs the hatchling hook,
+#    which runs cabal, renames the foreign library to <module>.abi3.so, writes
+#    the stub package <module>-stubs/ with scripts/h2py-stubs.py, and tags the
+#    wheel cp312-abi3-<platform>.
 #    The wheel is built straight from the source tree, never from an sdist,
 #    because the Haskell sources live outside the packaging directory.
 # 2. delocate-wheel (macOS) or auditwheel (Linux), in a staging directory,
@@ -18,7 +24,8 @@
 #    OS and are left alone.
 # 3. A throwaway venv installs the repaired wheel, and
 #    scripts/check-installed-wheel.py checks that the module and every Haskell
-#    library come from the wheel, and that the licences and stubs are there.
+#    library come from the wheel, and that the licences and stubs are there;
+#    then the smoke test of [tool.h2py], if any, runs there.
 #
 # On macOS the deployment target comes from cabal.project, which passes it to
 # GHC's C compiler, assembler and linker; MACOSX_DEPLOYMENT_TARGET is set to
@@ -33,6 +40,8 @@
 #   python   the interpreter to build against; defaults to .venv/bin/python
 #            and then to H2PY_PYTHON.
 # Environment:
+#   H2PY_PACKAGE_DIR the packaging directory, relative to the root of the tree
+#                    (default: h2py-examples/python)
 #   H2PY_WHEEL_DIR   where the repaired wheel lands (default: build/wheelhouse)
 #   H2PY_SKIP_VERIFY set to skip the fresh-venv check
 #   UV               the uv executable (default: uv on PATH, then ~/.local/bin/uv)
@@ -47,6 +56,18 @@ if [ ! -x "${python}" ]; then
   exit 1
 fi
 uv="${UV:-$(command -v uv || echo "${HOME}/.local/bin/uv")}"
+package_dir="${H2PY_PACKAGE_DIR:-h2py-examples/python}"
+case "${package_dir}" in
+  /*) ;;
+  *) package_dir="${root}/${package_dir}" ;;
+esac
+if [ ! -f "${package_dir}/pyproject.toml" ]; then
+  echo "build-wheel: no pyproject.toml in ${package_dir}; set H2PY_PACKAGE_DIR to the packaging directory" >&2
+  exit 1
+fi
+# h2py_name, h2py_module, h2py_foreign_library, h2py_smoke_test, ...
+config="$("${python}" -I "${root}/scripts/wheel-config.py" --shell "${package_dir}/pyproject.toml")"
+eval "${config}"
 
 if [ "$(uname -s)" = Darwin ]; then
   target="$(grep -o -- '-mmacosx-version-min=[0-9.]*' cabal.project | sort -u | cut -d= -f2)"
@@ -72,18 +93,18 @@ rm -rf "${raw}"
 mkdir -p "${raw}" "${wheelhouse}"
 
 # The build front end and the repair tools live in the build interpreter's
-# environment, at the versions h2py-examples/python/build-requirements.txt
-# locks with hashes.
+# environment, at the versions build-requirements.txt in the packaging
+# directory locks with hashes.
 # Every Python step runs isolated (-I): the build/ directory at the root of
 # the tree would otherwise pass for the `build` package.
-lock="${root}/h2py-examples/python/build-requirements.txt"
+lock="${package_dir}/build-requirements.txt"
 echo "build-wheel: installing the wheel tools into $(dirname "${python}") from ${lock##*/}"
 "${uv}" pip install --quiet --python "${python}" --require-hashes -r "${lock}"
 
-echo "build-wheel: building the wheel with ${python}"
+echo "build-wheel: building the wheel of ${h2py_name} (module ${h2py_module}) with ${python}"
 # --no-isolation: hatchling is already in the environment, and the hook wants
 # the interpreter whose headers cabal.project.local names, not a copy of it.
-"${python}" -I -m build --wheel --no-isolation --outdir "${raw}" "${root}/h2py-examples/python"
+"${python}" -I -m build --wheel --no-isolation --outdir "${raw}" "${package_dir}"
 wheel="$(ls "${raw}"/*.whl | head -1)"
 echo "build-wheel: raw wheel ${wheel} ($(du -h "${wheel}" | cut -f1))"
 
@@ -128,8 +149,8 @@ echo "build-wheel: repaired wheel $(basename "${repaired}") ($(du -h "${repaired
 
 # Every library the repair tool bundled has its licence in the wheel.
 "${python}" -I "${root}/scripts/wheel-licenses.py" --check-wheel "${repaired}" \
-  --licenses "${root}/h2py-examples/python/third-party-licenses" \
-  --pyproject "${root}/h2py-examples/python/pyproject.toml" flib:h2py_examples
+  --licenses "${package_dir}/third-party-licenses" \
+  --pyproject "${package_dir}/pyproject.toml" --module "${h2py_module}" "flib:${h2py_foreign_library}"
 
 if [ "$(uname -s)" != Darwin ]; then
   # glibc 2.41 and later refuse to load a library that asks for an executable
@@ -165,13 +186,18 @@ if [ -z "${H2PY_SKIP_VERIFY:-}" ]; then
   "${uv}" pip install --quiet --python "${tmp}/venv/bin/python" "${repaired}"
   (
     cd "${tmp}"
-    "${tmp}/venv/bin/python" "${root}/scripts/check-installed-wheel.py" h2py-examples h2py_examples
-    "${tmp}/venv/bin/python" -c 'import h2py_examples as m; assert m.Counter(1).get() == 1 and m.add(40, 2) == 42'
+    "${tmp}/venv/bin/python" "${root}/scripts/check-installed-wheel.py" "${h2py_name}" "${h2py_module}"
+    if [ -n "${h2py_smoke_test}" ]; then
+      echo "build-wheel: running the smoke test of ${h2py_name}"
+      "${tmp}/venv/bin/python" -c "${h2py_smoke_test}"
+    fi
   )
 fi
 
-# Every check passed: the wheel replaces this package's previous ones.
-find "${wheelhouse}" -maxdepth 1 -name 'h2py_examples-*.whl' -delete
+# Every check passed: the wheel replaces this distribution's previous ones,
+# which are named as it is up to the version and the tags.
+wheel_file="$(basename "${repaired}")"
+find "${wheelhouse}" -maxdepth 1 -name "${wheel_file%%-*}-*.whl" -delete
 mv "${repaired}" "${wheelhouse}/"
 rm -rf "${raw}"
-echo "build-wheel: ${wheelhouse}/$(basename "${repaired}")"
+echo "build-wheel: ${wheelhouse}/${wheel_file}"

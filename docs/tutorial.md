@@ -16,7 +16,7 @@ An H2Py module is three things:
    ```
 
 3. A Cabal `foreign-library` stanza of type `native-shared` with `ghc-options: -threaded`, the C file under `c-sources`, and, on macOS, `ld-options: "-Wl,-undefined,dynamic_lookup"`; `h2py-examples/h2py-examples.cabal` is the model.
-   The library that Cabal builds, `libtutorial.dylib` or `.so`, is renamed to `tutorial.abi3.so`, the file name CPython imports (`scripts/install-module.sh` does it), and a wheel is built by the hook under `h2py-examples/python/`.
+   The library that Cabal builds, `libtutorial.dylib` or `.so`, is renamed to `tutorial.abi3.so`, the file name CPython imports (`scripts/install-module.sh` does it), and a wheel is built by the hook under `h2py-examples/python/`; [Shipping wheels](#shipping-wheels) sets that up for a project of your own.
 
 The name in `pymodule` must match `H2PY_MODULE`.
 
@@ -463,3 +463,234 @@ PYTHONPATH=build .venv/bin/python -m pytest h2py-examples/tests
 `H2Py.Examples.Tutorial` is compiled by that build and registered as the `h2py_examples.tutorial` submodule through `tutorialSpec`, which `Module.hs` lists next to the other submodules; the top-level `h2py_examples.Counter` is `H2Py.Examples.Counter`, snippet 1 with docstrings and an `add` function.
 Both modules declare a class named `Counter`, which is fine: a class is registered under its module's name, so the two are `h2py_examples.Counter` and `h2py_examples.tutorial.Counter`, and the splice resolves each `''Counter` to the registration of the module the name comes from.
 To turn the tutorial into a module of its own, keep the `pymodule "tutorial"` line, add a stanza to the cabal file, a C file with `H2PY_MODULE tutorial`, and rename the built library to `tutorial.abi3.so`.
+
+## Shipping wheels
+
+A module of your own ships the way `h2py_examples` does: one `cp312-abi3` wheel per platform, for macOS 11 and later on arm64 and x86_64 and for `manylinux_2_28` on x86_64 and aarch64, each carrying the GHC runtime and every Haskell library the module links against, their licences, and the module's stubs.
+The machinery is the hatchling hook under `h2py-examples/python/` and the scripts under `scripts/`, which learn what to build from a `[tool.h2py]` table in the wheel's `pyproject.toml`.
+This section sets it up for a project of its own: the `Counter` of snippet 1, registered with a `pymethods` of its four methods and `pymodule "counter" [] [''Counter]` as the module `counter`, in a Cabal package and a Python distribution both named `h2py-counter`.
+
+### What the project holds
+
+```
+h2py-counter/
+├── cabal.project
+├── h2py-counter.cabal
+├── LICENSE
+├── src/Counter.hs                the Haskell module, ending in pymodule "counter"
+├── cbits/init.c                  #define H2PY_MODULE counter
+├── tests/test_counter.py         the pytest suite
+├── python/                       the packaging directory
+│   ├── pyproject.toml
+│   ├── hatch_build.py            ┐
+│   ├── build-requirements.in     │ copied from h2py-examples/python/
+│   ├── build-requirements.txt    ┘
+│   ├── LICENSE                   written by wheel-licenses.py
+│   └── third-party-licenses/     copied, then updated by wheel-licenses.py
+└── scripts/                      copied from scripts/
+```
+
+From `scripts/`, copy `configure-python.sh`, `install-module.sh`, `h2py-stubs.py`, `wheel-config.py`, `wheel-licenses.py`, `build-wheel.sh`, `manylinux-wheel.sh`, `test-wheel.sh` and `check-installed-wheel.py`, at the H2Py commit your `cabal.project` pins, and copy them again when you move the pin.
+The scripts take the directory above them as the project's root, and the hook takes the nearest directory above `pyproject.toml` that has a `cabal.project`, so `scripts/` sits next to `cabal.project`.
+
+### `cabal.project`
+
+```cabal
+packages: .
+
+-- The Hackage index, pinned: every build of a commit resolves the same
+-- versions, so the committed licence notices keep matching the wheels.
+index-state: hackage.haskell.org 2026-09-20T08:21:40Z
+
+source-repository-package
+  type: git
+  location: https://github.com/konn/h2py.git
+  tag: <the H2Py commit you build against>
+  subdir: h2py
+
+-- The pure-borrow branch H2Py needs, with the settings H2Py builds it with.
+source-repository-package
+  type: git
+  location: https://github.com/SoftwareFoundationGroupAtKyotoU/pure-borrow.git
+  tag: a816d2a7eaf62b142faad58f291923ac4d98b469
+
+constraints: linear-base ==0.7.*
+
+package pure-borrow
+  flags: -examples
+
+-- Everything built on macOS, the cabal store included, targets macOS 11.
+if os(osx)
+  package *
+    ghc-options:
+      -optc-mmacosx-version-min=11.0
+      -optcxx-mmacosx-version-min=11.0
+      -opta-mmacosx-version-min=11.0
+      -optl-mmacosx-version-min=11.0
+```
+
+- H2Py and the branch of pure-borrow it needs are not on Hackage, so both come from git; take the `pure-borrow` tag, the `linear-base` constraint and the `-examples` flag from H2Py's own `cabal.project` at the commit you pin.
+- The `index-state` pin keeps the licence notices true: without it, a new release of any dependency changes what the wheel bundles, and the licence check fails the next build.
+  Start from H2Py's, bump it deliberately, and run `wheel-licenses.py --write` (below) after each bump.
+- The macOS stanza makes the wheel install on macOS 11 and later.
+  It passes the deployment target to GHC's C and C++ compilers, assembler and linker for every package, those in the cabal store included, since as `ghc-options` it is part of every store package's hash, which `MACOSX_DEPLOYMENT_TARGET` is not.
+  The hook tags the wheel `macosx_11_0_<arch>` from it and `build-wheel.sh` checks the built objects against it, so it must name exactly one version, a major one.
+  GHC does not recompile a module when only these options change, so remove `dist-newstyle/build` after changing it.
+
+The toolchain is H2Py's: GHC 9.12.4, which `configure-python.sh` names in `cabal.project.local`, and cabal-install 3.14.2.0.
+
+### The Cabal package
+
+```cabal
+cabal-version: 3.4
+name: h2py-counter
+version: 0.1.0.0
+license: BSD-3-Clause
+license-file: LICENSE
+build-type: Simple
+
+foreign-library counter
+  type: native-shared
+  hs-source-dirs: src
+  other-modules: Counter
+  c-sources: cbits/init.c
+  default-language: GHC2021
+  ghc-options: -threaded
+
+  if os(osx)
+    ld-options: "-Wl,-undefined,dynamic_lookup"
+
+  build-depends:
+    base >=4.20 && <5,
+    h2py,
+    linear-base >=0.7,
+    pure-borrow,
+    text,
+```
+
+This is the stanza of [What a module is](#what-a-module-is); the package's `license-file` becomes the wheel's own licence.
+
+### Building and testing in place
+
+```bash
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python pytest
+H2PY_CABAL_PACKAGES=h2py-counter scripts/configure-python.sh .venv/bin/python
+cabal build h2py-counter
+scripts/install-module.sh counter
+PYTHONPATH=build .venv/bin/python -m pytest tests
+```
+
+CPython 3.12 is the oldest version the `cp312-abi3` wheels claim, and the one H2Py's CI builds them with.
+`configure-python.sh` writes the interpreter's include directory into `cabal.project.local` for `h2py` and for each package in `H2PY_CABAL_PACKAGES`, whose default is `h2py-examples`; the first build compiles H2Py and pure-borrow into the cabal store.
+`install-module.sh counter` copies `libcounter.dylib` (`.so` on Linux) to `build/counter.abi3.so`; a third argument names the foreign library when its name is not the module's.
+
+### `pyproject.toml`
+
+```toml
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "h2py-counter"
+version = "0.1.0"
+description = "A counter whose state lives in the Haskell heap."
+requires-python = ">=3.12"
+license = "BSD-3-Clause AND BSD-2-Clause AND ISC AND MIT AND NCSA AND HaskellReport AND LGPL-3.0-or-later"
+license-files = ["LICENSE", "third-party-licenses/*"]
+
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+core-metadata-version = "2.4"
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
+[tool.h2py]
+module = "counter"
+smoke-test = "import counter; c = counter.Counter(40); c.incr(2); assert c.get() == 42"
+tests = "../tests"
+```
+
+Every key of `[tool.h2py]` is optional; `scripts/wheel-config.py` resolves them for the hook and the scripts, and its docstring is the reference.
+
+| Key | What it names | Default |
+|---|---|---|
+| `module` | the importable name: `H2PY_MODULE`, the name in `pymodule`, and `<module>.abi3.so` in the wheel | the project's name with `-` and `.` as `_` |
+| `foreign-library` | the `foreign-library` stanza that builds the module | the module's name |
+| `cabal-package` | the Cabal package that holds the stanza | the project's name |
+| `smoke-test` | Python source that `build-wheel.sh` and `test-wheel.sh` run where nothing but the wheel and its dependencies is installed | none |
+| `tests` | the pytest suite that `test-wheel.sh` runs, relative to `pyproject.toml` | none |
+| `test-requires` | what `test-wheel.sh` installs for the suite | `["pytest"]` |
+
+The project's name would make the module `h2py_counter`, so `module` is set, and the foreign library and the Cabal package follow from the defaults; `h2py-examples/python/pyproject.toml` sets all six.
+The wheel holds only what the hook puts in it, hence `bypass-selection`; the licence expression and `license-files` are the subject of the next section.
+
+### Licences
+
+The wheel bundles the GHC runtime and every Haskell library the module links against, and each travels with its licence.
+hatchling reads `license-files` before any build hook runs, so the licence texts are committed, and the build checks them rather than generating them.
+Start from the example's: copy `h2py-examples/python/third-party-licenses/` to `python/third-party-licenses/`, and in its `GMP-NOTICE.txt` replace `h2py_examples` with `h2py_counter`, the name the wheel's files start with, since the notice names the directories the repair tools bundle libraries into (`h2py_counter.dylibs` on macOS, `h2py_counter.libs` on Linux).
+Then, after the build above:
+
+```bash
+.venv/bin/python scripts/wheel-licenses.py --write \
+  --licenses python/third-party-licenses --pyproject python/pyproject.toml flib:counter
+```
+
+`--write` gives `HASKELL-LIBRARIES.txt` a section for every library in the closure of `flib:counter`, with the licence text its package installs; GHC's boot libraries are the exception, since a GHC installation puts GHC's own licence in their place, and their sections are kept from the copy.
+It also copies the package's `license-file` to `python/LICENSE`, and prints the SPDX identifiers the `license` expression must name.
+A boot library that your module links and H2Py does not (`directory`, `process`, …) has no section to keep: `--write` names it, and needs `--ghc-source` with GHC's unpacked source release, `ghc-9.12.4-src.tar.xz`.
+Code of other origin compiled into a dependency needs a notice of its own, as xxHash in the runtime and in `hashable` has: search a new dependency's C sources for third-party copyright notices, add each notice to `third-party-licenses/`, say what it covers in the `README.txt` there, and name its licence in the `license` expression.
+Commit the result.
+From then on the hook runs `wheel-licenses.py --check` at every build and `build-wheel.sh` runs `--check-wheel` on the repaired wheel, so a new dependency, or a new version from a new `index-state`, fails the build until `--write` has run again.
+
+### Building the wheels
+
+On macOS, from the project's root:
+
+```bash
+H2PY_PACKAGE_DIR=python scripts/build-wheel.sh .venv/bin/python
+```
+
+`H2PY_PACKAGE_DIR` is the packaging directory, relative to the root; every script defaults to `h2py-examples/python`.
+`build-wheel.sh` installs the build tools that `build-requirements.txt` locks into the interpreter's environment and builds the wheel, which runs the hook.
+The hook runs `configure-python.sh` for that interpreter, whose headers the module is compiled against, and `cabal build h2py-counter:flib:counter`, checks the licence files, puts `libcounter.dylib` into the wheel as `counter.abi3.so`, writes the stub package `counter-stubs/`, where type checkers look for the stubs of an installed extension module, and tags the wheel `cp312-abi3-macosx_11_0_<arch>`.
+delocate then bundles the Haskell libraries into `h2py_counter.dylibs/`, `wheel-licenses.py --check-wheel` compares what it bundled with the licences, and a fresh virtual environment installs the wheel, where `check-installed-wheel.py` checks that the module and every Haskell library load from it and that the licences and stubs are installed, and the smoke test runs.
+Only then does the wheel land in `build/wheelhouse/`.
+
+The manylinux wheels are built in the PyPA image that H2Py's workflow pins, with the tree mounted read-only and named volumes keeping GHC and the cabal store between runs (`manylinux_2_28_aarch64` on an arm64 machine):
+
+```bash
+docker run --rm -v "$PWD":/src:ro -v "$PWD/build/wheelhouse-linux":/out \
+  -v h2py-ghc:/opt/ghc -v h2py-cabal:/opt/cabal \
+  -e CABAL_DIR=/opt/cabal -e H2PY_WHEEL_DIR=/out -e H2PY_PACKAGE_DIR=python \
+  quay.io/pypa/manylinux_2_28_x86_64:2026.09.14-1 /src/scripts/manylinux-wheel.sh
+```
+
+`manylinux-wheel.sh` installs GHC 9.12.4 and cabal-install 3.14.2.0 from pinned, checksummed bindists built on glibc 2.28, builds a copy of the tree with the image's CPython 3.12, and runs `build-wheel.sh`, whose auditwheel step bundles the Haskell libraries, `libgmp` and GHC's `libffi` and tags the wheel `manylinux_2_28_<arch>`.
+It refuses an image whose `gmp` package is not the one `GMP-NOTICE.txt` names, so keep the image tag, or update the notice with it.
+
+### Testing the wheels
+
+```bash
+H2PY_PACKAGE_DIR=python scripts/test-wheel.sh .venv/bin/python macosx_11_0_arm64 build/wheelhouse
+H2PY_PACKAGE_DIR=python scripts/test-wheel.sh uv:3.14 macosx_11_0_arm64 build/wheelhouse
+```
+
+`test-wheel.sh` installs the wheel for the given platform, with its dependencies and nothing else, into a fresh environment of the given interpreter, `uv:VERSION` being a uv-managed CPython, which is what `uv python install` gives users.
+Then, from a directory that holds no build of the module, it runs `check-installed-wheel.py` and the smoke test, installs `test-requires`, and runs the `tests` suite.
+Run it with the oldest and the newest CPython the wheel claims, and the Linux wheels also in a container of the oldest glibc their tag admits, `almalinux:8`.
+
+### In CI
+
+`.github/workflows/haskell.yml` in the H2Py repository does all of the above on every push and is the model to copy, with the two scripts under `ci/scripts/` that it runs: the `build` job builds and tests in place, the `wheel-macos` and `wheel-linux` jobs build the wheels, the `test-wheels-*` jobs test each one as above, and the `wheels` job collects them with their checksums.
+Set `H2PY_PACKAGE_DIR: python` and `H2PY_CABAL_PACKAGES: h2py-counter` in the workflow's `env`, and adapt the steps that name the example:
+
+- `scripts/install-module.sh counter`, and `tests` for the pytest step;
+- the stubs step with `counter` and `--stub-package`, so that what it renders, checks with `mypy --strict build/counter-stubs` and compares with a committed copy is what the wheel carries;
+- the licence check with `--licenses python/third-party-licenses --pyproject python/pyproject.toml flib:counter`;
+- `cabal build --only-dependencies h2py-counter` in `wheel-macos`; `manylinux-wheel.sh --deps-only` reads the package from `[tool.h2py]`.
+
+The steps that check H2Py itself, `gen-weakapi.sh` and the typing-fail cases, have no counterpart in your project.

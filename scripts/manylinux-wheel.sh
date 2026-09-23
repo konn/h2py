@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build the manylinux wheel of h2py-examples inside a PyPA manylinux image.
+# Build the manylinux wheel of an H2Py extension module, h2py-examples unless
+# H2PY_PACKAGE_DIR names another, inside a PyPA manylinux image.
 #
 # Run it from the root of the repository, in quay.io/pypa/manylinux_2_28_x86_64
 # or quay.io/pypa/manylinux_2_28_aarch64 at the tag CI pins; CI runs it as a
@@ -19,9 +20,9 @@
 #    the dist-newstyle or cabal.project.local of a checkout shared with the
 #    host.
 # 3. The gmp package of the image must be the one
-#    h2py-examples/python/third-party-licenses/GMP-NOTICE.txt names, since
-#    auditwheel copies its library into the wheel and the notice says where
-#    its source is.
+#    third-party-licenses/GMP-NOTICE.txt in the packaging directory names,
+#    since auditwheel copies its library into the wheel and the notice says
+#    where its source is.
 # 4. scripts/build-wheel.sh runs with the image's oldest supported CPython;
 #    its auditwheel step bundles the Haskell libraries, libgmp and GHC's
 #    libffi and tags the wheel with the image's policy (AUDITWHEEL_PLAT, which
@@ -31,6 +32,8 @@
 # cabal store, so that CI can save the store before the wheel steps run.
 #
 # Environment:
+#   H2PY_PACKAGE_DIR the packaging directory, relative to the root of the tree
+#                    (default h2py-examples/python); see scripts/build-wheel.sh
 #   H2PY_GHC_PREFIX  where GHC and cabal are installed (default /opt/ghc)
 #   H2PY_WORKDIR     the copy of the tree that is built (default /tmp/h2py-build)
 #   H2PY_WHEEL_DIR   where the wheel lands (default build/wheelhouse-<policy>)
@@ -78,6 +81,19 @@ python=/opt/python/cp312-cp312/bin/python
 export PATH="${prefix}/bin:${PATH}"
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 
+# The packaging directory is named relative to the tree, which is built from
+# a copy; build-wheel.sh reads the same variable there.
+export H2PY_PACKAGE_DIR="${H2PY_PACKAGE_DIR:-h2py-examples/python}"
+case "${H2PY_PACKAGE_DIR}" in
+  /*)
+    echo "manylinux-wheel: H2PY_PACKAGE_DIR must be relative to the root of the tree, not ${H2PY_PACKAGE_DIR}" >&2
+    exit 1
+    ;;
+esac
+# h2py_name, h2py_cabal_package, ...
+config="$("${python}" -I "${root}/scripts/wheel-config.py" --shell "${root}/${H2PY_PACKAGE_DIR}/pyproject.toml")"
+eval "${config}"
+
 fetch() {
   local url="$1" sha256="$2" file="$3"
   curl -fsSL --retry 3 -o "${file}" "${url}"
@@ -94,7 +110,7 @@ if ! rpm -q gmp-devel >/dev/null 2>&1; then
   dnf install -y -q "gmp-devel-${gmp_evr}"
 fi
 gmp="gmp $(rpm -q --qf '%{VERSION}-%{RELEASE}' gmp)"
-notice="${root}/h2py-examples/python/third-party-licenses/GMP-NOTICE.txt"
+notice="${root}/${H2PY_PACKAGE_DIR}/third-party-licenses/GMP-NOTICE.txt"
 if ! grep -qF -- "${gmp} package" "${notice}"; then
   echo "manylinux-wheel: the image has ${gmp}, which ${notice} does not name;" >&2
   echo "manylinux-wheel: update the notice and its source links before building" >&2
@@ -139,11 +155,11 @@ venv="$(mktemp -d)/venv"
 "${venv}/bin/python" -m pip install -q --disable-pip-version-check uv
 
 cd "${work}"
-scripts/configure-python.sh "${venv}/bin/python"
+H2PY_CABAL_PACKAGES="${H2PY_CABAL_PACKAGES:-} ${h2py_cabal_package}" scripts/configure-python.sh "${venv}/bin/python"
 cabal update
 if [ "${deps_only}" -eq 1 ]; then
-  cabal build --only-dependencies h2py-examples
-  echo "manylinux-wheel: the dependencies of h2py-examples are in the cabal store"
+  cabal build --only-dependencies "${h2py_cabal_package}"
+  echo "manylinux-wheel: the dependencies of ${h2py_cabal_package} are in the cabal store"
   exit 0
 fi
 H2PY_AUDITWHEEL_PLAT="${AUDITWHEEL_PLAT}" UV="${venv}/bin/uv" H2PY_WHEEL_DIR="${out}" \

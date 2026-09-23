@@ -5,8 +5,8 @@ An H2Py module carries its own stub: the hidden ``__h2py_stub__()`` returns a
 ``.pyi`` rendered from the same description the initialiser registered, so
 the stub can never disagree with the module.
 This script imports the module and writes ``<module>.pyi`` and a ``py.typed``
-marker next to the extension file, which is where a type checker looks for
-them once the module is installed.
+marker next to the extension file, where a type checker finds them when that
+directory is on its search path.
 
 Usage::
 
@@ -14,17 +14,21 @@ Usage::
     h2py-stubs.py --path build h2py_examples    # after adding build/ to sys.path
     h2py-stubs.py --output DIR h2py_examples    # write into DIR instead
     h2py-stubs.py --check DIR h2py_examples     # exit 1 unless DIR holds the same files
+    h2py-stubs.py --stub-package h2py_examples  # <module>-stubs/ even without submodules
 
 When the module registers submodules (``submodule`` in ``pymodule``), each
 one has its own ``__h2py_stub__`` and the stubs are written as a stub-only
 package, ``<module>-stubs/__init__.pyi`` plus one ``.pyi`` per submodule,
 which is the layout PEP 561 gives to a single-file extension with submodules.
+``--stub-package`` writes that layout for a module without submodules too:
+it is the one a wheel carries, since mypy does not read a ``.pyi`` beside an
+extension module in ``site-packages`` and finds ``<module>-stubs/``.
 
 ``--check DIR`` renders the same files and compares them with those under
 ``DIR`` (a committed golden copy, say), writing nothing; a missing or stale
 file is reported and the exit status is 1.
 ``hatch_build.py`` in the packaging directory of ``h2py-examples`` runs this
-script with ``--output`` to put the same files into a wheel.
+script with ``--output`` and ``--stub-package`` to put the stubs into a wheel.
 """
 
 from __future__ import annotations
@@ -60,6 +64,11 @@ def main(argv: list[str] | None = None) -> int:
         metavar="DIR",
         help="write nothing; compare with the files under DIR and exit 1 if any is missing or stale",
     )
+    parser.add_argument(
+        "--stub-package",
+        action="store_true",
+        help="write the stub-only package <module>-stubs/ even for a module without submodules",
+    )
     args = parser.parse_args(argv)
 
     for directory in reversed(args.path):
@@ -82,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"h2py stubs: {args.module} has no __file__; pass --output", file=sys.stderr)
         return 2
 
-    files = render_all(module, args.module.rsplit(".", 1)[-1], target)
+    files = render_all(module, args.module.rsplit(".", 1)[-1], target, args.stub_package)
 
     if args.check:
         return check(files)
@@ -91,10 +100,10 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def render_all(module: types.ModuleType, name: str, target: Path) -> dict[Path, str]:
+def render_all(module: types.ModuleType, name: str, target: Path, stub_package: bool = False) -> dict[Path, str]:
     """The files to write, as ``{path: contents}``."""
     subs = submodules_of(module)
-    if not subs:
+    if not subs and not stub_package:
         return {
             target / f"{name}.pyi": module.__h2py_stub__(),
             target / "py.typed": "",
