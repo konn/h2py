@@ -22,6 +22,11 @@ Packages:
 - `pure-borrow` comes from a `source-repository-package` stanza in `cabal.project`, pinned to the head of its `konn/impure-pure-borrow-tagged` branch; H2Py needs the world-indexed `BO'` that only that branch has.
 - Cabal nix-style builds only; `cabal.project` is the source of truth.
   No `package.yaml`.
+- cabal-install 3.14.2.0, in CI and in the manylinux bindists alike.
+- `cabal.project` pins the Hackage `index-state`, so every build of a commit resolves the same versions and the committed licence notices keep matching the wheels.
+  Bump it deliberately: then run `scripts/wheel-licenses.py --write` (see Wheels) and commit what it changes.
+- On macOS, `cabal.project` passes `-mmacosx-version-min=11.0` to GHC's C and C++ compilers, assembler and linker for every package, so everything built targets macOS 11; as `ghc-options` it is part of every store package's hash, which `MACOSX_DEPLOYMENT_TARGET` is not.
+  GHC does not recompile a module when only those options change, so remove `dist-newstyle/build` after changing the target.
 - Python: `uv venv --python python3.13 .venv && uv pip install numpy pytest mypy`.
   CPython 3.12 and later for `abi3`; the `abi3t` flag needs CPython 3.15.
 
@@ -33,25 +38,53 @@ cabal test all                                   # h2py-test (tasty), h2py-inspe
 scripts/check-typing-fail.sh                     # fixtures under h2py/test/typing-fail must fail to compile
 scripts/install-module.sh                        # copies the built .dylib/.so to build/h2py_examples.abi3.so
 PYTHONPATH=build .venv/bin/python -m pytest h2py-examples/tests   # Python suite against build/
-scripts/gen-weakapi.sh --check                   # macOS: every CPython reference of the library is weak
-scripts/build-wheel.sh                           # a repaired wheel, installed and imported in a fresh venv
+scripts/gen-weakapi.sh --check                   # every CPython reference of the library is weak
+scripts/build-wheel.sh                           # a repaired macOS wheel, installed and checked in a fresh venv
+scripts/test-wheel.sh .venv/bin/python macosx_11_0_arm64 build/wheelhouse   # the whole suite against the installed wheel
 ```
 
-`scripts/test-all.sh` runs everything but the wheel in order, including the stub package's regeneration, `mypy --strict` on it and its comparison with the committed copy under `h2py-examples/stubs/` (regenerate with `scripts/h2py-stubs.py --path build --output h2py-examples/stubs h2py_examples` after a change to a registration).
+The manylinux wheel builds in the pinned PyPA image; named volumes keep GHC and the cabal store between runs, and the tree is mounted read-only:
+
+```bash
+docker run --rm -v "$PWD":/src:ro -v "$PWD/build/wheelhouse-linux":/out \
+  -v h2py-ghc:/opt/ghc -v h2py-cabal:/opt/cabal -e CABAL_DIR=/opt/cabal -e H2PY_WHEEL_DIR=/out \
+  quay.io/pypa/manylinux_2_28_aarch64:2026.09.14-1 /src/scripts/manylinux-wheel.sh
+```
+
+`scripts/test-all.sh` runs everything but the wheel in order, including the licence check of the wheel, the stub package's regeneration, `mypy --strict` on it and its comparison with the committed copy under `h2py-examples/stubs/` (regenerate with `scripts/h2py-stubs.py --path build --output h2py-examples/stubs h2py_examples` after a change to a registration).
 A stale `~/.local/bin/c2hs` on this machine hangs cabal's configure probe in uninterruptible sleep; run cabal with that directory dropped from `PATH` until it is removed.
-`fourmolu` cannot read the `default-extensions` of a `foreign-library` stanza, so the sources of `h2py-examples` are formatted with the stanza's extensions passed explicitly (`fourmolu -o -XLinearTypes -o -XQualifiedDo … -i file.hs`; the CI job has the full list); the library's sources need no flags.
+cabal decides what to recompile from the content of each source file, not of the headers it includes: after changing a header under `h2py/include`, remove the build directories of `h2py` and `h2py-examples` under `dist-newstyle/build` (touching the `.c` file is not enough).
+`fourmolu` cannot read the `default-extensions` of a `foreign-library` stanza, so the sources of `h2py-examples` are formatted with the stanza's extensions passed explicitly (`fourmolu -o -XLinearTypes -o -XQualifiedDo … -i file.hs`; the CI job has the full list, `-XBangPatterns` included); the library's sources need no flags.
+CI pins fourmolu 0.20.0.0, the version the editor hooks use; a newer one orders some imports differently.
 A change under `h2py/src`, `h2py/cbits`, `h2py/include` or `h2py-examples/` must pass all of them before it is committed.
 Never invoke a bare `python3` in this repository; use `.venv/bin/python`.
 
-## The macOS rule for CPython references
+## The rule for CPython references
 
-GHC loads `libHSh2py` into its own process, with no interpreter, to run the Template Haskell splices of any module that uses `pyclass`, `pymethods` or `pymodule`, and dyld on current macOS binds every symbol of a library at load time.
-So the library may reference the interpreter only through weak imports, and Cabal passes neither `ld-options` nor `ghc-shared-options` to the library's dylib link, which rules out a linker flag.
+GHC loads `libHSh2py` into its own process, with no interpreter, to run the Template Haskell splices of any module that uses `pyclass`, `pymethods` or `pymodule`.
+dyld on current macOS binds every symbol of a library at load time, and on Linux GHC's loader binds calls lazily but resolves the address of a function the shim stores in a slot table when it loads the library.
+So the library may reference the interpreter only through weak imports, on both platforms, and Cabal passes neither `ld-options` nor `ghc-shared-options` to the library's shared link, which rules out a linker flag.
 Three rules follow, all mechanical:
 
 - No CPython *data* symbol is referenced anywhere (`PyExc_*`, `Py_None`, `Py_True`, `&PyLong_Type`); `h2py.c` fetches such constants through `builtins` at first use and caches them (`h2py_exception_type`, `h2py_builtin_type`, `h2py_none`).
 - Every CPython function the Haskell side calls goes through a one-line wrapper in `h2py/cbits/api.c`; a `foreign import` never names a `Py*` symbol directly.
-- `h2py/include/h2py/weakapi.h`, included by `h2py.h` after `Python.h`, holds a `#pragma weak` for every referenced symbol; after adding a CPython call, build the library and run `scripts/gen-weakapi.sh`, then rebuild; `--check` is what CI runs.
+- `h2py/include/h2py/weakapi.h`, included by `h2py.h` after `Python.h`, holds a `#pragma weak` for every referenced symbol; after adding a CPython call, build the library and run `scripts/gen-weakapi.sh`, then rebuild; `--check` is what CI runs on macOS and Linux.
+
+## Wheels
+
+Only wheels are distributed: `cp312-abi3` for macOS 11 and later on arm64 and x86_64, and `manylinux_2_28` on x86_64 and aarch64.
+There is no sdist upload and no musllinux wheel.
+
+- `scripts/build-wheel.sh` builds, repairs (delocate) and checks the macOS wheel; `scripts/manylinux-wheel.sh` does the same inside the pinned PyPA `manylinux_2_28` image with pinned, checksummed GHC and cabal-install bindists built on glibc 2.28, and auditwheel bundles the Haskell libraries, libgmp and GHC's libffi.
+  The build and repair tools and all their dependencies are locked with hashes in `h2py-examples/python/build-requirements.txt`, generated from `build-requirements.in` by the `uv pip compile` command written there.
+- `h2py-examples/python/hatch_build.py` tags a macOS wheel from the deployment target in `cabal.project` and the built library's architecture, never from the interpreter, whose python.org builds report universal2.
+- The licence files a wheel carries are committed under `h2py-examples/python/`: `LICENSE` and `third-party-licenses/` (its `README.txt` says what each file covers), because hatchling reads `project.license-files` before any build hook runs.
+  `scripts/wheel-licenses.py --check` compares them with the build plan in the hook, in `scripts/test-all.sh` and in CI, and `--check-wheel` compares every library the repaired wheel bundles with them.
+  After a dependency change, run it with `--write --ghc-source <unpacked ghc-9.12.4-src.tar.xz>`, since a GHC installation puts GHC's own licence in every boot library's documentation directory, and update the licence expression in `pyproject.toml` if it asks.
+  Code of other origin compiled into a package (xxHash, LLVM's relocation tables, GMP) has its own notice, listed in the script's `EXTRA_NOTICES`; search a new dependency's C sources for third-party copyright notices before adding it.
+  `scripts/manylinux-wheel.sh` refuses an image whose gmp package is not the one `GMP-NOTICE.txt` names, so bumping the image tag means updating the notice and its source links.
+- CI runs the build-and-test job on all four platforms (x86_64 and aarch64 Linux, Apple silicon and Intel macOS), builds each wheel on its platform, then `scripts/test-wheel.sh` installs it into clean interpreters, the oldest and newest CPython it claims from the runner and from uv's managed builds, and runs the whole test suite against it, the Linux wheels also in AlmaLinux 8, the oldest glibc their tag admits, and in Debian 13, whose glibc 2.41 refuses executable stacks; one build leg checks the boot libraries' licence texts against GHC's source release.
+  `scripts/check-installed-wheel.py` checks that the module and every Haskell library come from the wheel and that the licences and stubs are installed; the `Wheels` job collects the tested wheels and their checksums into one artifact, and the `CI` job, the one to require in branch protection, fails unless every other job succeeded.
 
 ## Conventions
 

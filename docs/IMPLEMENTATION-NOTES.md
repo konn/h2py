@@ -71,6 +71,7 @@ The design document itself is kept as written; these notes are the amendments.
 
 28. **Wheels** are built by a hatchling hook that runs `cabal build` from the repository checkout, and repaired with `delocate` on macOS: 36 Haskell runtime dylibs are bundled, 12.8 MB compressed and 62 MB unpacked; the platform tag follows the minimum OS version the libraries were built for, so a portable wheel needs `MACOSX_DEPLOYMENT_TARGET` set when the store and the tree are built.
     `libgmp` is statically linked into GHC's `ghc-bignum` on macOS, so no LGPL dylib is bundled there.
+    Superseded by 54 to 58: the environment variable does not reach a store that already exists, and the macOS wheels convey GMP all the same, inside `libHSghc-bignum`.
 29. **Stubs** are written by `scripts/h2py-stubs.py` from `__h2py_stub__`, and `mypy --strict` passes on the example's root stub; a class registered with an ABC renders the ABC as a base without type arguments, which `mypy --strict` rejects for `Sequence`.
 
 ## Measured (Phase 1 gate, R3, and Phase 4)
@@ -129,3 +130,93 @@ What each confirmed finding changed:
     The example's `Stack` registers `collections.abc.Sized` rather than `Sequence`, since a stack without slice support is not a typed sequence.
 50. **The `qsortDC` inspection** at `Storable Double` finds the workload specialised but the scheduler's `Traversable` and `RandomGen` dictionaries retained, because pure-borrow's `divideAndConquer'` has no `INLINABLE` pragma; the wanted property is recorded with `expectFailBecause` in the `h2py-inspection` suite, and the fix is upstream.
 51. **Gate tests added**: every operation's refcount deltas on success, `Left` and exception paths; callback re-entrancy answering `busy`; two handles to one object; asynchronous poisoning through `timeout` and `throwTo`; a hold released at the end of `attach'`; receiver-form `BIO` and detached `BO` bodies releasing the interpreter; a `parBIO` branch error surfacing as `RuntimeError`; the fork and recursion guards in subprocesses; an unregistered class answering `RuntimeError`; a hand-written unsealed instance failing at first use; a subclass constructor building helpers of their own type.
+
+## Redistributable wheels (2026-09-23)
+
+The first CI run, on the initial commit, failed on both Ubuntu jobs and on the macOS wheel job, and the macOS wheel built locally was tagged `macosx_26_0_arm64`, installable on the build host's macOS only.
+What it took to make wheels that install anywhere their tags claim:
+
+52. **CPython references are weak on Linux too.**
+    GHC's loader binds calls through the PLT lazily, but the shim stores the addresses of `PyType_GenericAlloc` and `PyObject_Free` in slot tables, whose relocations are resolved when GHC loads the library for Template Haskell; the Ubuntu jobs stopped there with `undefined symbol: PyObject_Free`.
+    `weakapi.h` no longer limits its pragmas to macOS, `scripts/gen-weakapi.sh` reads GNU `nm` output and rejects strong references on Linux as well, and so does the `h2py-weakcheck` suite; at run time the references bind to the interpreter as before.
+53. **Each thread's stack bounds are found once.**
+    The headroom check of 33 asked `pthread_getattr_np` on every call, and glibc answers it for the initial thread by reading `/proc/self/maps` and querying the stack rlimit: a call from Python's main thread cost 185 to 300 µs on Linux, against 1.6 µs from another thread.
+    The lowest address of the thread's stack is now kept in a thread-local after the first call.
+54. **Everything built on macOS targets macOS 11.**
+    `cabal.project` passes `-mmacosx-version-min=11.0` to GHC's C compiler, assembler and linker as `package *` `ghc-options` under `if os(osx)`, which enter every store package's hash; `MACOSX_DEPLOYMENT_TARGET` does not, so an existing store kept the host's version.
+    11.0 is the minimum of GHC's own release libraries and the first macOS for Apple silicon.
+    GHC does not recompile a module when only these options change, so `scripts/build-wheel.sh` refuses any object of the local packages built for a newer macOS, and sets `MACOSX_DEPLOYMENT_TARGET` to the same version for delocate, which then checks every library it bundles.
+55. **A wheel's platform tag is the build's, not the interpreter's.**
+    The CI wheel job's python.org interpreter reports `macosx-10.13-universal2`, and delocate refused an arm64-only module under that tag; `hatch_build.py` now tags a macOS wheel from the target in `cabal.project` and the architecture `lipo` reports for the built library, and a Linux wheel `linux_<arch>` for auditwheel to replace.
+56. **Linux wheels are `manylinux_2_28`.**
+    `scripts/manylinux-wheel.sh` runs inside the PyPA `manylinux_2_28` image with GHC 9.12.4's rocky8 (x86_64) or deb10 (aarch64) bindist, both built on glibc 2.28, and cabal-install 3.14.2.0, each pinned by SHA-256; it builds a copy of the tree, so that a checkout shared with the host keeps its own `dist-newstyle` and `cabal.project.local`.
+    auditwheel bundles the Haskell libraries, `libgmp.so.10` and GHC's `libffi.so.8`; the static route stays closed on x86_64 Linux, whose bindist archives are not position independent.
+    No musllinux wheel is built and only wheels are distributed, by the maintainer's decision.
+57. **Every wheel carries its licences.**
+    hatchling resolves `project.license-files` before any build hook runs, so the files are committed under `h2py-examples/python/`: `LICENSE`, and `third-party-licenses/` with one section per Haskell library the build plan links in, GMP's notice with the LGPL-3.0 and GPL-3.0 texts, and libffi's licence.
+    `scripts/wheel-licenses.py --check`, run by the hook, `scripts/test-all.sh` and CI, fails when a linked library has no section or the licence expression in `pyproject.toml` misses an identifier.
+    A GHC installation puts GHC's own licence in the documentation directory of every boot library, `text` and `bytestring` included, so the boot libraries' texts come from GHC's source tree (`--write --ghc-source`).
+58. **The release gate installs every wheel as a user would.**
+    CI builds the wheels on `macos-26`, `macos-15-intel` and in the manylinux image on `ubuntu-24.04` and `ubuntu-24.04-arm`, installs each into a clean interpreter, CPython 3.12 and 3.14, away from any build tree, and runs the whole suite against it, the Linux wheels also in AlmaLinux 8, the oldest glibc their tag admits.
+    `scripts/check-installed-wheel.py` requires the module and every Haskell library the process loads to come from the installed wheel, and the licence files and stubs to be installed.
+    The build-and-test job runs on the same four platforms, the two a developer machine here can test (Apple silicon, and aarch64 Linux in Docker) included, so that CI never rests on a local run.
+
+Three reviewers with one lens each (runtime, FFI and concurrency; soundness of the result, licensing included; CI and ergonomics) were told to refute the plan of 52 to 58 while it was being implemented, and the verification runs turned up three more faults.
+Every finding was fixed or answered:
+
+59. **Stack bounds, second round.**
+    A failed lookup is no longer remembered (glibc's needs a file descriptor for the initial thread, so running out of them at the first call had turned the guard off for good), and a call that finds too little room looks again before refusing, so a stack rlimit raised after the first call is honoured; one lowered after it is not seen, which the code says.
+    `test_recursion.py` runs the recursion on two threads in turn as well, the second after the first has exited.
+60. **A missing interpreter function is an `ImportError`.**
+    `scripts/gen-weakapi.sh` also writes a table of every weak reference with its address, and `PyInit_` (and `PyModExport_`) of `<h2py/init.h>` checks it before the module definition reaches CPython: an interpreter that lacks one of them gets an `ImportError` naming the missing functions instead of a call to address 0.
+    Measured through `PYTHONPATH`, despite the `cp312-abi3` tag: CPython 3.10 names `PyErr_GetRaisedException`, `PyErr_SetRaisedException`, `PyObject_GetTypeData` and `PyObject_Vectorcall`, and 3.11 the first three.
+    The check first sat in the exec slot, which CPython before 3.12 never reaches, since it refuses the module's `Py_mod_multiple_interpreters` slot first (`SystemError: ... unknown slot ID 3`); the implementation review caught that.
+61. **Licences, completed.**
+    The GHC source and the store packages' sources were searched for third-party copyright notices: xxHash is compiled into the runtime (`rts/Hash.c`) and into `hashable`, and LLVM's ELF relocation tables into the runtime's linker on Linux, so `XXHASH-LICENSE.txt` and `LLVM-LICENSE.txt` join the notices, `NCSA` joins the licence expression, and `EXTRA_NOTICES` in `scripts/wheel-licenses.py` records which package needs which.
+    bytestring's and text's per-file notices are covered by their packages' licences, ghc-bignum's wrappers by ghc-bignum's, and GHC ships no Unicode data licence for its generated tables, so none is added.
+    `--check-wheel` checks the repaired wheel itself, since the build plan is a superset of what delocate bundles and cannot see what auditwheel adds: every bundled Haskell library must belong to the plan's closure, anything else must be GMP or libffi, and the wheel's metadata must carry every licence file.
+    `GMP-NOTICE.txt` names the exact sources (gmp 6.1.2-11.el8's source RPM for Linux, gmp 6.3.0 and ghc-bignum inside `ghc-9.12.4-src.tar.xz` for macOS), and `scripts/manylinux-wheel.sh` refuses an image whose gmp package the notice does not name; libffi's licence is the one in the 3.5.2 tarball GHC builds.
+    Whether the source directions satisfy the LGPL is the maintainer's judgement; the notice gives what a recipient needs to rebuild either library.
+62. **Builds are reproducible.**
+    `cabal.project` pins the Hackage `index-state` at the state the notices were generated from, CI uses cabal-install 3.14.2.0 like the manylinux bindists, the manylinux image is pinned by tag, and the build and repair tools with all their dependencies are locked with hashes in `h2py-examples/python/build-requirements.txt`; the wheel's metadata version is pinned at 2.4.
+    Before the pin, any release of a dependency on Hackage would have failed every wheel build on the licence check.
+    The image is pinned by tag rather than digest; besides libgmp, which is checked by version, it shapes the wheel through its patchelf and CPython headers, which the tag pins as well.
+63. **CI's cache keys were empty.**
+    `ci/scripts/calc-cache-keys.js` passed each further pattern to `hashFiles` as its workspace argument, so the hashes of `cabal.project` and of the sources came out empty and a change to them kept the old key; it now passes one newline-joined pattern.
+    Wheel jobs have cache keys of their own, and every job saves its store only when it is complete and was not restored exactly.
+64. **The macOS floor and the glibc ceiling.**
+    `-optcxx-mmacosx-version-min=11.0` covers C++ sources; a target with a minor version (11.3) is refused, since a wheel tag from macOS 11 on names the major version only.
+    Haskell foreign imports carry no availability information, so no gate can prove that a wheel runs on macOS 11 short of running it there, which no hosted runner offers; the review's scan of the wheel's system imports found nothing newer than macOS 10.15, and the objects are built for 11.0.
+    glibc 2.41 and later refuse libraries that ask for an executable stack, so `scripts/build-wheel.sh` fails when a bundled one does.
+65. **The gate, completed.**
+    Every job has a timeout, a newer push to a pull request cancels the older run, macOS and Linux wheels are tested by separate jobs so that one platform's failure does not hide the other's results, each test also runs under a uv-managed CPython (python-build-standalone), the glibc floor runs in a clean AlmaLinux 8 with its own CPython 3.12, and the `Wheels` job collects the tested wheels with their checksums into one artifact, the check to require in branch protection.
+    Publishing (a GitHub release, PyPI) is left to the maintainer.
+66. **Found while verifying.**
+    CPython 3.14 passes a local to a call without a new reference, so `sys.getrefcount` reports one less than 3.12 and 3.13 for an object only a local holds; the refcount tests compare with a fresh object measured the same way, in the same frame, and pass on 3.12, 3.13 and 3.14.
+    `scripts/build-wheel.sh` runs its Python steps isolated, since the `build/` directory at the root passed for the `build` package when it was not installed.
+    `scripts/install-module.sh` replaces the module with a new file, since macOS kills a process that maps a signed binary rewritten in place after it had been loaded.
+67. **Deferred, with reasons.**
+    Two H2Py modules in one process: design 5.9's statement that auditwheel's renaming keeps two wheels apart even under `RTLD_GLOBAL` is wrong, since renaming changes sonames and not symbols, and on macOS the flat namespace makes a second module abort; a guard that turns the second import into an `ImportError` is separate work.
+    Making the wheel scripts reusable by downstream projects (package directory, module name and smoke test as parameters) is separate work too.
+
+The implementation review, again three reviewers with one lens each, found the following, all fixed but one:
+
+68. **The symbol check moved to `PyInit_`** (see 60), where CPython before 3.12 reaches it.
+    A recheck of the stack bounds whose lookup fails keeps the bound already found and refuses the call, instead of letting it through unguarded.
+    The recursion tests assert the shim's own message, a depth over ten on every thread, and a second thread on a 64 MiB stack that must go deeper than the first, so a bound shared across threads fails them.
+    `gen-weakapi.sh --check` and `h2py-weakcheck` fail when the library shows no CPython reference at all, rather than passing on a wrong file.
+    Answered rather than changed: a stack rlimit lowered after a thread's first call is not seen (CPython 3.14 caches its own stack bounds per thread the same way, and seeing it would take a system call per call); a single level that uses more than the 256 KiB margin defeats the guard, as it did before.
+69. **The wheel's own licence names its holder**: `h2py-examples/LICENSE` read `Copyright 2026` with no name, and now matches `h2py/LICENSE`.
+70. **The repaired-wheel check checks what it claims.**
+    It finds shared libraries by their magic bytes anywhere in the wheel, requires the GHC runtime among them, allows nothing but `libHS*` on macOS and auditwheel's `libgmp` and `libffi` on Linux, and compares GMP (the SBOM on Linux, the version string in `libHSghc-bignum` on macOS) and libffi with the versions the notices name.
+    Every licence file must be in the wheel byte for byte, listed as a `License-File`, with the `License-Expression` of `pyproject.toml`, which must be a plain conjunction and now names `HaskellReport` (base, array and ghc-internal carry the Haskell Report's licence); `GMP-NOTICE.txt` must name the plan's GHC.
+    The executable-stack check requires exactly one `GNU_STACK` header without the E flag in every library and fails when `readelf` does, and CI runs the Linux wheels in Debian 13 (glibc 2.41) as well as AlmaLinux 8.
+    One build leg checks the boot libraries' licence texts against GHC's checksummed source release.
+    The wheel is repaired and checked in a staging directory and reaches the wheelhouse only when every check has passed, replacing only this package's earlier wheels.
+    `--write` lists the packages it adds, for their C sources to be read for code of other origin; a table of reviewed versions was judged more machinery than the risk warrants.
+71. **CI, the second round.**
+    The fourmolu job had failed on the first run on two counts: it could not parse two files without `BangPatterns`, which GHC2021 turns on for the foreign library, and `latest` resolved to a fourmolu that orders imports differently from the editor hooks' 0.20.0.0; it now pins 0.20.0.0 and passes `-XBangPatterns`, and every tracked file passes.
+    A `CI` job fails unless every other job succeeded and is the one to require in branch protection, since GitHub counts a skipped job as passed; the wheel jobs save the cabal store right after building the dependencies; the checks after a build no longer hide one another; the Ubuntu label is pinned; `gmp-devel` is installed at the image's gmp version, so that the live mirrors cannot upgrade gmp away from the notice; the build job installs `libgmp-dev` itself, which the setup action does not; the token is read-only.
+    Not changed: one architecture's wheel failure still skips the other architecture's tests of the same platform, since splitting the jobs per architecture would duplicate them.
+    The GMP source offer points to gmplib.org, AlmaLinux's vault and downloads.haskell.org, all reachable today; attaching the sources to each release would remove that dependence, and is the maintainer's call.
+

@@ -15,9 +15,20 @@ the extension and its stubs at the top level of the wheel:
 
 The wheel is tagged ``cp312-abi3-<platform>`` because the module is built
 against the limited API at 3.12 (``Py_LIMITED_API = 0x030C0000``).
+The platform is the one the module was built for, not the interpreter's:
+on macOS it is ``macosx_<target>_<arch>``, with the deployment target that
+``cabal.project`` passes to GHC's C compiler, assembler and linker and the
+architecture of the built library, because a python.org interpreter reports
+``macosx-10.13-universal2`` while GHC builds one architecture; on Linux it is
+``linux_<arch>``, which auditwheel replaces with the manylinux tag.
 The build interpreter (``sys.executable``) is the one whose headers the module
 is compiled against; ``scripts/configure-python.sh`` records its include
 directory in ``cabal.project.local``.
+
+Before packaging, ``scripts/wheel-licenses.py --check`` compares the licence
+files that ``project.license-files`` lists (``LICENSE`` and
+``third-party-licenses/``) with the libraries the build plan links in, and the
+build fails when a bundled library has no licence text.
 
 The wheel that leaves this hook still refers to the Haskell runtime libraries
 by absolute ``@rpath`` entries; ``scripts/build-wheel.sh`` runs
@@ -30,11 +41,14 @@ Environment variables:
   extension suffix and the wheel tag.
 - ``H2PY_SKIP_CABAL``: when set, the hook does not run ``cabal build`` and
   packages whatever ``dist-newstyle`` already holds.
+- ``MACOSX_DEPLOYMENT_TARGET``: must agree with ``cabal.project`` when set;
+  the tag always follows ``cabal.project``.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -78,6 +92,7 @@ class H2PyBuildHook(BuildHookInterface):  # type: ignore[type-arg]
             _run(["cabal", "build", "h2py-examples"], cwd=repo)
 
         built = _find_built_library(repo, module)
+        _check_licences(repo, scripts, python_dir, module)
         ext_name = f"{module}.{abi}.so"
         ext_path = stage / ext_name
         shutil.copy2(built, ext_path)
@@ -89,7 +104,7 @@ class H2PyBuildHook(BuildHookInterface):  # type: ignore[type-arg]
 
         build_data["pure_python"] = False
         build_data["infer_tag"] = False
-        build_data["tag"] = _wheel_tag(abi)
+        build_data["tag"] = _wheel_tag(abi, repo, built)
         force_include = build_data.setdefault("force_include", {})
         force_include[str(ext_path)] = ext_name
         for path in stub_files:
@@ -144,9 +159,63 @@ def _files_under(root: Path) -> set[Path]:
     return {p for p in root.rglob("*") if p.is_file()}
 
 
-def _wheel_tag(abi: str) -> str:
-    platform_tag = sysconfig.get_platform().replace("-", "_").replace(".", "_")
-    if abi == "abi3t":
-        # PEP 803: the free-threaded stable ABI, CPython 3.15 and later.
-        return f"cp315-abi3t-{platform_tag}"
-    return f"cp312-abi3-{platform_tag}"
+def _check_licences(repo: Path, scripts: Path, python_dir: Path, module: str) -> None:
+    """Fail the build when a library the module links in has no licence file."""
+    _run(
+        [
+            sys.executable,
+            str(scripts / "wheel-licenses.py"),
+            "--check",
+            "--plan",
+            str(repo / "dist-newstyle" / "cache" / "plan.json"),
+            "--licenses",
+            str(python_dir / "third-party-licenses"),
+            "--pyproject",
+            str(python_dir / "pyproject.toml"),
+            f"flib:{module}",
+        ],
+        cwd=repo,
+    )
+
+
+def _wheel_tag(abi: str, repo: Path, built: Path) -> str:
+    python_tag = "cp315" if abi == "abi3t" else "cp312"
+    return f"{python_tag}-{abi}-{_platform_tag(repo, built)}"
+
+
+def _platform_tag(repo: Path, built: Path) -> str:
+    """The platform the module was built for."""
+    if sys.platform != "darwin":
+        return sysconfig.get_platform().replace("-", "_").replace(".", "_")
+    target = macos_deployment_target(repo)
+    requested = os.environ.get("MACOSX_DEPLOYMENT_TARGET")
+    if requested and _macos_version(requested) != _macos_version(target):
+        raise RuntimeError(
+            f"MACOSX_DEPLOYMENT_TARGET={requested} but cabal.project builds for macOS {target}; "
+            "unset it or change both"
+        )
+    major, minor = _macos_version(target)
+    archs = subprocess.run(["lipo", "-archs", str(built)], capture_output=True, text=True, check=True).stdout.split()
+    if len(archs) != 1:
+        raise RuntimeError(f"{built} holds architectures {archs}; H2Py wheels hold exactly one")
+    return f"macosx_{major}_{minor}_{archs[0]}"
+
+
+def macos_deployment_target(repo: Path) -> str:
+    """The -mmacosx-version-min that cabal.project passes to GHC on macOS."""
+    found = set(re.findall(r"-mmacosx-version-min=([0-9]+(?:\.[0-9]+)?)", (repo / "cabal.project").read_text()))
+    if len(found) != 1:
+        raise RuntimeError(f"cabal.project must set one macOS deployment target, not {sorted(found)}")
+    return found.pop()
+
+
+def _macos_version(text: str) -> tuple[int, int]:
+    parts = [int(part) for part in text.split(".")]
+    if len(parts) > 2 and any(parts[2:]):
+        raise RuntimeError(f"macOS deployment target {text}: patch versions are not supported")
+    version = (parts[0], parts[1] if len(parts) > 1 else 0)
+    # From macOS 11 on, a wheel tag names the major version only, so a target
+    # with a minor version cannot be expressed: 11.3 would be tagged 11_0.
+    if version[0] >= 11 and version[1] != 0:
+        raise RuntimeError(f"macOS deployment target {text}: from macOS 11 on it must be a major version (11.0, 12.0, ...)")
+    return version

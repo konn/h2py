@@ -81,8 +81,14 @@ static struct PyModuleDef H2PY_CAT(h2py_def_, H2PY_MODULE) = {
     NULL,
 };
 
+/* The symbol check runs before the module definition reaches CPython, whose
+ * versions before 3.12 refuse its Py_mod_multiple_interpreters slot before any
+ * exec slot could run. */
 PyMODINIT_FUNC H2PY_CAT(PyInit_, H2PY_MODULE)(void)
 {
+    if (h2py_check_cpython_symbols() < 0) {
+        return NULL;
+    }
     return PyModuleDef_Init(&H2PY_CAT(h2py_def_, H2PY_MODULE));
 }
 
@@ -103,6 +109,9 @@ static PyModuleDef_Slot H2PY_CAT(h2py_export_slots_, H2PY_MODULE)[] = {
 PyMODINIT_FUNC H2PY_CAT(PyModExport_, H2PY_MODULE)(PyObject *spec)
 {
     (void) spec;
+    if (h2py_check_cpython_symbols() < 0) {
+        return NULL;
+    }
     return (PyObject *) H2PY_CAT(h2py_export_slots_, H2PY_MODULE);
 }
 #endif

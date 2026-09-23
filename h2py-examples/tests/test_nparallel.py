@@ -347,7 +347,9 @@ def test_refcounts_are_stable():
 
 def test_result_refcount_of_new_array():
     buf = np_.iota(5)
-    assert sys.getrefcount(buf) == 2
+    # Only the local holds the buffer; see test_result_refcount in test_runtime.py.
+    fresh = object()
+    assert sys.getrefcount(buf) == sys.getrefcount(fresh)
 
 
 def test_two_threads_sorting_one_array_is_refused():

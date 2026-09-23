@@ -1,0 +1,9 @@
+# The tools that build and repair the wheels.  build-requirements.txt is the
+# complete, hash-pinned lock that scripts/build-wheel.sh installs; regenerate
+# it after changing this file with
+#   uv pip compile --universal --generate-hashes --python-version 3.12 \
+#     build-requirements.in -o build-requirements.txt
+build==1.6.1
+hatchling==1.32.4
+delocate==0.13.0
+auditwheel==6.8.2

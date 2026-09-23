@@ -2,6 +2,12 @@ packages:
   h2py/*.cabal
   h2py-examples/*.cabal
 
+-- The Hackage index is pinned, so that every build of a commit, on every
+-- platform, resolves the same versions, and the licence notices committed
+-- under h2py-examples/python/third-party-licenses keep matching what the
+-- wheels bundle.  Bump it deliberately, then run scripts/wheel-licenses.py
+-- --write (see AGENTS.md).
+index-state: hackage.haskell.org 2026-09-20T08:21:40Z
 tests: True
 benchmarks: True
 -- pure-borrow's own freeze and CI pin the linear-base 0.7 series; h2py must
@@ -25,3 +31,18 @@ package pure-borrow
   flags: -examples
   tests: False
   benchmarks: False
+
+-- Every object and library built on macOS targets macOS 11, the minimum of
+-- GHC's own release libraries and the first release for Apple Silicon, so
+-- that a wheel built here installs on macOS 11 and later.
+-- The options go to GHC's C and C++ compilers, assembler and linker; as ghc-options
+-- they are part of every store package's hash, which MACOSX_DEPLOYMENT_TARGET
+-- is not, so a store built for another target is never reused.
+-- hatch_build.py and build-wheel.sh read the version from here.
+if os(osx)
+  package *
+    ghc-options:
+      -optc-mmacosx-version-min=11.0
+      -optcxx-mmacosx-version-min=11.0
+      -opta-mmacosx-version-min=11.0
+      -optl-mmacosx-version-min=11.0
