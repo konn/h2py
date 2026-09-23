@@ -4,7 +4,7 @@
 
 H2Py lets you write CPython extension modules in Haskell in the spirit of [PyO3](https://pyo3.rs): module-level functions, classes whose state lives in the Haskell heap, errors in both directions, conversions for the usual scalar and container types, and a call may release the interpreter to run multi-core Haskell kernels.
 It is built on [pure-borrow](https://github.com/SoftwareFoundationGroupAtKyotoU/pure-borrow)'s Rust-style borrowing for Linear Haskell: a Python object reference is a borrow of an arena-owned slot, a method receives its payload as a `Mut` or `Share` borrow, and the code that may touch the interpreter runs in `Py π γ`, a world of pure-borrow's impure `BO'` monad that carries the attachment scope `π` next to the borrow lifetime `γ`.
-The type checker refuses a reference that outlives its call, a payload mutated through two handles at once, and a Python operation from a thread that is not attached; the design document, [`docs/H2Py-DESIGN.md`](docs/H2Py-DESIGN.md), records why.
+The type checker refuses a reference that outlives its call, a payload mutated through two handles at once, and a Python operation from a thread that is not attached.
 
 ## A counter
 
@@ -78,7 +78,7 @@ The C side of the module is two lines:
 
 - [`h2py/`](h2py/): the library, `H2Py` and its submodules, the C shim `cbits/h2py.c` and the headers under `include/h2py/`.
 - [`h2py-examples/`](h2py-examples/): the example extension module `h2py_examples`, its `pytest` suite, and the Python packaging (`python/`).
-- [`docs/`](docs/): the design document and the tutorial.
+- [`docs/tutorial.md`](docs/tutorial.md): the tutorial.
 - [`scripts/`](scripts/): the build helpers described below.
 
 ## Building and testing
@@ -108,8 +108,9 @@ The type stubs of a module are rendered by the module itself, from the same desc
 .venv/bin/python scripts/h2py-stubs.py --path build --check h2py-examples/stubs h2py_examples   # against the committed copy
 ```
 
-A wheel is built by `scripts/build-wheel.sh`: the hatchling hook in `h2py-examples/python/hatch_build.py` runs `cabal build`, renames the foreign library to `h2py_examples.abi3.so`, writes the same stub package with `scripts/h2py-stubs.py`, and tags the wheel `cp312-abi3`; `delocate-wheel` then bundles the Haskell runtime libraries with their load paths rewritten, and the script installs the result into a throwaway venv and imports it.
-This has been run on macOS only; the script has an `auditwheel` branch for Linux, which is meant to bundle the runtime the same way but has not been exercised yet.
+Wheels are built by `scripts/build-wheel.sh` on macOS, and on Linux by `scripts/manylinux-wheel.sh` inside the PyPA `manylinux_2_28` image (with Docker, when run locally).
+The hatchling hook in `h2py-examples/python/hatch_build.py` runs `cabal build`, renames the foreign library to `h2py_examples.abi3.so`, writes the same stub package with `scripts/h2py-stubs.py`, and tags the wheel `cp312-abi3`; `delocate-wheel` or `auditwheel` then bundles the Haskell runtime libraries with their load paths rewritten, and the script installs the result into a throwaway venv and checks it.
+The wheels install on CPython 3.12 and later, on macOS 11 and later (arm64 and x86_64) and on Linux with glibc 2.28 or later (x86_64 and aarch64), and carry the licences of the Haskell libraries, GMP and libffi they bundle; CI builds all four and runs the test suite against each.
 
 ## Limitations
 
@@ -122,7 +123,7 @@ These features are not implemented yet:
 - More than one Haskell-built extension module per process.
 - Embedding Python into a Haskell program; `inline-python` covers that direction.
 
-Constraints of a GHC runtime inside a process it does not own (design, section 5.9):
+Constraints of a GHC runtime inside a process it does not own:
 
 - The runtime starts on first import, with `-threaded`, `--install-signal-handlers=no` so that `SIGINT` stays Python's, the options of the module's `H2PY_RTS_OPTS` define, and those of the `H2PY_RTS_OPTS` environment variable.
 - `hs_exit` is never called: Python never unloads extension modules, and process exit reclaims everything.
@@ -131,12 +132,13 @@ Constraints of a GHC runtime inside a process it does not own (design, section 5
 - One runtime per process: two H2Py wheels each bundle their own `libHSrts` and cannot be imported together.
 - Never block, while attached, on a Haskell thread that must itself attach; release the interpreter with `detach` first.
 
-## Template Haskell on macOS
+## Template Haskell and CPython symbols
 
 The registration splices (`pyclass`, `pymethods`, `pymodule`) make GHC load `libHSh2py` into the compiler process, which has no Python interpreter in it.
 Every CPython function the library calls therefore goes through a wrapper in `h2py/cbits/api.c`, and every CPython symbol referenced from C is marked `#pragma weak` in `h2py/include/h2py/weakapi.h`, so that the library loads with those symbols unresolved and binds them once an extension module is imported.
-`scripts/gen-weakapi.sh` regenerates the header from the undefined symbols of the built library, and `--check` (run in CI on macOS) fails if a reference is missing; no CPython data symbol (`PyExc_*`, `Py_None`, `&PyLong_Type`) may be referenced, which is why constants are fetched through `h2py_exception_type`, `h2py_builtin_type` and `h2py_none`.
-On Linux undefined symbols in a shared object are lazy by default and none of this is needed.
+This is needed on macOS, where dyld binds every symbol when it loads a library, and on Linux, where the functions whose addresses the library keeps must be found when GHC loads it.
+`scripts/gen-weakapi.sh` regenerates the header from the undefined symbols of the built library, and `--check` (run in CI on macOS and Linux) fails if a reference is missing or not weak; no CPython data symbol (`PyExc_*`, `Py_None`, `&PyLong_Type`) may be referenced, which is why constants are fetched through `h2py_exception_type`, `h2py_builtin_type` and `h2py_none`.
+An interpreter that lacks one of those functions gets an `ImportError` naming it when the module is imported.
 
 ## Copyright
 
