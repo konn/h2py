@@ -1,0 +1,209 @@
+cabal-version: 3.4
+name: h2py
+version: 0.1.0.0
+synopsis: PyO3-style CPython extension modules in Haskell, on Pure Borrow
+description:
+  H2Py lets you write CPython extension modules in Haskell in the spirit of
+  PyO3: module-level functions, classes whose payload lives in the Haskell heap,
+  errors in both directions, conversions, and NumPy buffers, all on top of the
+  Rust-style borrowing of @pure-borrow@.
+  Python object references are borrows of arena-owned slots, methods receive
+  their payload as a @Mut@ or @Share@ borrow, and a call may detach from the
+  interpreter to run statically disjoint, multi-core kernels over buffers that
+  Python owns.
+  See "H2Py" for the tutorial.
+
+homepage: https://github.com/konn/h2py#readme
+bug-reports: https://github.com/konn/h2py/issues
+author: Hiromi ISHII
+maintainer: konn.jinro@gmail.com
+copyright: (c) Hiromi ISHII 2026- present
+license: BSD-3-Clause
+license-file: LICENSE
+category: Foreign, Linear Haskell
+build-type: Simple
+tested-with: ghc ==9.12.4
+extra-doc-files:
+  CHANGELOG.md
+  README.md
+
+extra-source-files:
+  cbits/*.c
+  include/h2py/*.h
+  test/golden/*.pyi
+  test/typing-fail/*.hs
+
+source-repository head
+  type: git
+  location: https://github.com/konn/h2py
+  subdir: h2py
+
+flag abi3t
+  description:
+    Target the free-threaded stable ABI (PEP 803, CPython 3.15 and later)
+    instead of the GIL-holding stable ABI (abi3, CPython 3.12 and later).
+
+  default: False
+  manual: True
+
+common defaults
+  default-language: GHC2021
+  default-extensions:
+    BlockArguments
+    DataKinds
+    DerivingStrategies
+    ExplicitNamespaces
+    LambdaCase
+    LinearTypes
+    OverloadedStrings
+    QualifiedDo
+    TypeOperators
+
+  ghc-options:
+    -Wall
+    -Wcompat
+    -Widentities
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+    -Wmissing-export-lists
+    -Wmissing-home-modules
+    -Wpartial-fields
+    -Wredundant-constraints
+    -Wunused-packages
+
+  build-depends:
+    base >=4.20 && <5,
+    linear-base >=0.7,
+
+library
+  import: defaults
+  hs-source-dirs: src
+  -- cabal-gild: discover src --exclude src/**/Utils.hs --exclude src/**/Utils/**/*.hs
+  exposed-modules:
+    H2Py
+    H2Py.Buffer
+    H2Py.Buffer.Internal
+    H2Py.Class
+    H2Py.Class.Internal
+    H2Py.Class.Iterator
+    H2Py.Class.Slot
+    H2Py.Convert
+    H2Py.Convert.Internal
+    H2Py.Exception
+    H2Py.Exception.Internal
+    H2Py.Module
+    H2Py.Module.Internal
+    H2Py.Object
+    H2Py.Object.Internal
+    H2Py.Object.Unsafe
+    H2Py.Py
+    H2Py.Py.Internal
+    H2Py.Py.Unsafe
+    H2Py.Runtime
+    H2Py.Runtime.Internal
+    H2Py.Runtime.Unsafe
+    H2Py.TH
+
+  -- cabal-gild: discover src --include src/**/Utils.hs --include src/**/Utils/**/*.hs
+  other-modules:
+  c-sources:
+    cbits/api.c
+    cbits/h2py.c
+    cbits/rts_init.c
+
+  include-dirs: include
+  install-includes:
+    h2py/h2py.h
+    h2py/init.h
+    h2py/weakapi.h
+
+  cc-options:
+    -std=c11
+    -Wall
+    -Wextra
+    -Wno-unused-parameter
+
+  if flag(abi3t)
+    cc-options: -DH2PY_ABI3T=1
+
+  -- An extension module resolves the interpreter's symbols at load time and
+  -- never links libpython, so the shim's own shared object must be allowed to
+  -- leave them undefined on macOS (Linux allows it by default).
+  if os(osx)
+    ghc-shared-options: "-optl-Wl,-weak_reference_mismatches,weak"
+    ld-options:
+      "-Wl,-undefined,dynamic_lookup"
+      "-Wl,-weak_reference_mismatches,weak"
+  build-depends:
+    bytestring,
+    containers,
+    pure-borrow,
+    template-haskell,
+    text,
+    vector,
+
+test-suite h2py-test
+  import: defaults
+  type: exitcode-stdio-1.0
+  main-is: Main.hs
+  hs-source-dirs: test
+  -- cabal-gild: discover test --exclude=test/Main.hs --exclude=test/typing-fail/**
+  other-modules:
+    H2Py.StubSpec
+    H2Py.TypingCases
+    H2Py.TypingSpec
+
+  ghc-options:
+    -threaded
+    -rtsopts
+    -with-rtsopts=-N
+
+  build-tool-depends: tasty-discover:tasty-discover >=5.0.1
+  build-depends:
+    h2py,
+    pure-borrow,
+    tasty,
+    tasty-hunit,
+    text,
+
+-- The Core inspection of section 5.7: the showcase kernel at the Storable
+-- backend a NumPy buffer takes, inside a BIO body. Kept in its own component,
+-- as pure-borrow keeps its own, so that the larger test component's
+-- unspecialised dictionaries do not reach the roots it inspects.
+test-suite h2py-inspection
+  import: defaults
+  type: exitcode-stdio-1.0
+  main-is: Main.hs
+  hs-source-dirs: test-inspection
+  -- cabal-gild: discover test-inspection --exclude=test-inspection/Main.hs
+  other-modules:
+    H2Py.Inspection.QSortDC
+
+  -- The -dsuppress-* set that makes a failing obligation readable belongs in
+  -- OPTIONS_GHC on the module that states the obligation, not here.
+  ghc-options:
+    -O2
+    -fplugin=Test.Tasty.Inspection.Plugin
+
+  build-depends:
+    h2py,
+    pure-borrow,
+    random,
+    tasty,
+    tasty-expected-failure,
+    tasty-inspection-testing,
+    vector,
+
+-- Guards the invariant that lets GHC load the library for Template Haskell
+-- with no interpreter in the process (see include/h2py/weakapi.h): no CPython
+-- data symbol is referenced from the shim, and on macOS every CPython
+-- reference of the built library is weak and listed in weakapi.h.
+test-suite h2py-weakcheck
+  import: defaults
+  type: exitcode-stdio-1.0
+  main-is: WeakCheck.hs
+  hs-source-dirs: test-weakcheck
+  build-depends:
+    directory,
+    filepath,
+    process,

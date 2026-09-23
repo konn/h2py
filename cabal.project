@@ -1,0 +1,27 @@
+packages:
+  h2py/*.cabal
+  h2py-examples/*.cabal
+
+tests: True
+benchmarks: True
+-- pure-borrow's own freeze and CI pin the linear-base 0.7 series; h2py must
+-- not be the first to build it against anything else.
+constraints: linear-base ==0.7.*
+-- The whole tree builds at -O2, as pure-borrow's own project does: its kernels
+-- are what the showcase runs, and its Core inspections assume it.
+optimization: 2
+
+-- H2Py depends on the world-indexed `BO'` of pure-borrow, which lives on the
+-- `konn/impure-pure-borrow-tagged` branch and is not released yet.
+-- The tag pins that branch's head so that the build is reproducible.
+source-repository-package
+  type: git
+  location: https://github.com/SoftwareFoundationGroupAtKyotoU/pure-borrow.git
+  tag: a816d2a7eaf62b142faad58f291923ac4d98b469
+
+-- The examples package is only buildable against pure-borrow's example flag off;
+-- keep its demo executables out of our plan.
+package pure-borrow
+  flags: -examples
+  tests: False
+  benchmarks: False

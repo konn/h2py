@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.19"]
+build-backend = "hatchling.build"
+
+[project]
+name = "h2py-examples"
+version = "0.1.0"
+description = "The example CPython extension module of H2Py: a Counter whose state lives in the Haskell heap."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "BSD-3-Clause"
+authors = [{ name = "Hiromi ISHII", email = "konn.jinro@gmail.com" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Haskell",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/konn/h2py"
+Issues = "https://github.com/konn/h2py/issues"
+
+# The wheel holds only what the build hook produces: the extension module
+# h2py_examples.abi3.so and its stub package h2py_examples-stubs/ (one .pyi per
+# submodule and the py.typed marker).  There is no Python package to discover,
+# so the file selection heuristics are bypassed and the hook force-includes
+# the files.
+[tool.hatch.build.targets.wheel]
+bypass-selection = true
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "hatch_build.py"
+
+# The sdist is the packaging directory alone; the Haskell sources live two
+# directories up and the wheel can only be built from a checkout of the
+# repository (see hatch_build.py).
+[tool.hatch.build.targets.sdist]
+include = ["pyproject.toml", "hatch_build.py", "README.md"]

@@ -1,0 +1,98 @@
+cabal-version: 3.4
+name: h2py-examples
+version: 0.1.0.0
+synopsis: The example extension module of H2Py
+description:
+  One CPython extension module, @h2py_examples@, built with H2Py: the @Counter@
+  class of the tutorial, and an @nparallel@ submodule with in-place, multi-core
+  kernels over NumPy arrays.
+  The @pytest@ suite under @tests/@ exercises it from Python.
+
+homepage: https://github.com/konn/h2py#readme
+bug-reports: https://github.com/konn/h2py/issues
+author: Hiromi ISHII
+maintainer: konn.jinro@gmail.com
+copyright: (c) Hiromi ISHII 2026- present
+license: BSD-3-Clause
+license-file: LICENSE
+category: Foreign, Linear Haskell
+build-type: Simple
+tested-with: ghc ==9.12.4
+extra-doc-files:
+  CHANGELOG.md
+  README.md
+
+extra-source-files:
+  cbits/*.c
+  tests/*.py
+
+source-repository head
+  type: git
+  location: https://github.com/konn/h2py
+  subdir: h2py-examples
+
+common defaults
+  default-language: GHC2021
+  default-extensions:
+    BlockArguments
+    DataKinds
+    DerivingStrategies
+    ExplicitNamespaces
+    LambdaCase
+    LinearTypes
+    OverloadedStrings
+    QualifiedDo
+    TypeOperators
+
+  ghc-options:
+    -Wall
+    -Wcompat
+    -Widentities
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+    -Wmissing-export-lists
+    -Wmissing-home-modules
+    -Wpartial-fields
+    -Wredundant-constraints
+    -Wunused-packages
+
+  build-depends:
+    base >=4.20 && <5,
+    linear-base >=0.7,
+
+-- The extension module itself. Cabal names the artifact libh2py_examples.dylib
+-- (.so on Linux); scripts/install-module.sh renames it to the file name CPython
+-- imports, h2py_examples.abi3.so.
+foreign-library h2py_examples
+  import: defaults
+  type: native-shared
+  hs-source-dirs: src
+  -- cabal-gild: discover src
+  other-modules:
+    H2Py.Examples.Concurrency
+    H2Py.Examples.Counter
+    H2Py.Examples.Module
+    H2Py.Examples.NParallel
+    H2Py.Examples.Ops
+    H2Py.Examples.Shapes
+    H2Py.Examples.Tutorial
+
+  c-sources: cbits/init.c
+  cc-options:
+    -std=c11
+    -Wall
+
+  -- -threaded is mandatory: several Python threads may enter at once, and every
+  -- CPython call that can run Python code is a safe foreign call.
+  ghc-options: -threaded
+
+  if os(osx)
+    ld-options: "-Wl,-undefined,dynamic_lookup"
+  build-depends:
+    bytestring,
+    containers,
+    h2py,
+    pure-borrow,
+    random,
+    text,
+    vector,

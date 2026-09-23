@@ -1,0 +1,221 @@
+name: Build and Test
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+# One job per (OS, CPython) pair builds the library, the Haskell suite and the
+# example extension module, then imports the module from that CPython and runs
+# the pytest suite against it.
+# GHC is fixed at 9.12.4, the version cabal.project.local pins; the matrix is
+# over the interpreter the module is built against, because the include
+# directory of that interpreter is what scripts/configure-python.sh records.
+#
+# Linux notes, so that nobody guesses at them later:
+# - The foreign library needs no `-undefined dynamic_lookup`: an ELF shared
+#   object may leave symbols undefined, and h2py-examples.cabal only passes
+#   that flag under `os(osx)`.
+# - GHC compiles the code of a `native-shared` foreign library with -fPIC on
+#   its own (-dynamic implies it), so nothing has to be added for that.
+# - The Haskell boot libraries of the ghcup bindist and the cabal store are
+#   built as shared objects, which is what a native-shared foreign library
+#   links against; ghc-bignum links the system libgmp.so.10 on Linux, so the
+#   runner needs libgmp (haskell-actions/setup installs it with GHC).
+# - scripts/gen-weakapi.sh is a macOS concern only: the weak references exist
+#   so that GHC can dlopen libHSh2py without an interpreter to run Template
+#   Haskell; on Linux undefined symbols in a shared object are already lazy.
+#   The `--check` step therefore runs on macOS alone.
+# - The wheel job below is macOS-only for now; the auditwheel branch of
+#   scripts/build-wheel.sh is written but has not been run in CI.
+
+jobs:
+  build:
+    name: Build and test (${{ matrix.os }}, Python ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    env:
+      ghc: "9.12.4"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        id: python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Set up GHC ${{ env.ghc }}
+        id: haskell
+        uses: haskell-actions/setup@v2
+        with:
+          ghc-version: ${{ env.ghc }}
+          cabal-version: latest
+          cabal-update: true
+
+      - name: Calculate cache keys
+        id: cache-keys
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const script = require('./ci/scripts/calc-cache-keys.js')
+            await script({ os: ${{ toJSON(matrix.os) }}, plan: "ghc-${{ env.ghc }}-py${{ matrix.python }}", path: "cabal.project", core, glob })
+
+      - name: Restore the cabal store
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.haskell.outputs.cabal-store }}
+          key: ${{ steps.cache-keys.outputs.store }}
+          restore-keys: ${{ steps.cache-keys.outputs.store-restore }}
+
+      - name: Restore dist-newstyle
+        uses: actions/cache/restore@v4
+        with:
+          path: dist-newstyle
+          key: ${{ steps.cache-keys.outputs.dist }}
+          restore-keys: ${{ steps.cache-keys.outputs.dist-restore }}
+
+      - name: Create the Python environment
+        run: |
+          uv venv --python "${{ steps.python.outputs.python-path }}" .venv
+          uv pip install --python .venv/bin/python numpy pytest mypy
+
+      - name: Configure for the target interpreter
+        # Writes cabal.project.local with the interpreter's include directory
+        # and the compiler; the interpreter is the one the module is built for.
+        run: scripts/configure-python.sh "${{ steps.python.outputs.python-path }}"
+
+      - name: Build dependencies
+        run: cabal build --only-dependencies all
+
+      - name: Save the cabal store
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.haskell.outputs.cabal-store }}
+          key: ${{ steps.cache-keys.outputs.store }}
+
+      - name: Build
+        run: cabal build all
+
+      - name: Save dist-newstyle
+        uses: actions/cache/save@v4
+        with:
+          path: dist-newstyle
+          key: ${{ steps.cache-keys.outputs.dist }}
+
+      - name: Haskell test suite
+        run: cabal test all
+
+      - name: Install the extension module
+        run: scripts/install-module.sh
+
+      - name: Python test suite
+        run: PYTHONPATH="${PWD}/build" .venv/bin/python -m pytest -q h2py-examples/tests
+
+      - name: Type stubs
+        # The module renders its own stubs, a stub-only package because it
+        # has submodules; mypy --strict must accept them, and they must match
+        # the committed copy under h2py-examples/stubs (regenerate it with
+        # --output h2py-examples/stubs after changing the registration).
+        run: |
+          .venv/bin/python scripts/h2py-stubs.py --path build --output build h2py_examples
+          .venv/bin/python -m mypy --strict build/h2py_examples-stubs
+          .venv/bin/python scripts/h2py-stubs.py --path build --check h2py-examples/stubs h2py_examples
+
+      - name: Weak CPython references (macOS)
+        if: runner.os == 'macOS'
+        run: scripts/gen-weakapi.sh --check
+
+      - name: Multiplicity-error cases
+        # The script exists once h2py/test/typing-fail/ does; until then the
+        # step is a no-op rather than a guess at its interface.
+        run: |
+          if [ -x scripts/check-typing-fail.sh ]; then
+            scripts/check-typing-fail.sh
+          else
+            echo "scripts/check-typing-fail.sh not present; skipped"
+          fi
+
+  wheel:
+    name: Wheel (macos-latest, Python 3.13)
+    runs-on: macos-latest
+    env:
+      ghc: "9.12.4"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: "3.13"
+      - uses: astral-sh/setup-uv@v6
+      - uses: haskell-actions/setup@v2
+        id: haskell
+        with:
+          ghc-version: ${{ env.ghc }}
+          cabal-version: latest
+          cabal-update: true
+      - name: Calculate cache keys
+        id: cache-keys
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const script = require('./ci/scripts/calc-cache-keys.js')
+            await script({ os: "macos-latest", plan: "ghc-${{ env.ghc }}-py3.13", path: "cabal.project", core, glob })
+      - name: Restore the cabal store
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.haskell.outputs.cabal-store }}
+          key: ${{ steps.cache-keys.outputs.store }}
+          restore-keys: ${{ steps.cache-keys.outputs.store-restore }}
+      - name: Create the Python environment
+        run: |
+          uv venv --python "${{ steps.python.outputs.python-path }}" .venv
+          uv pip install --python .venv/bin/python build hatchling delocate
+      - name: Build, repair and verify the wheel
+        # build-wheel.sh runs configure-python.sh and cabal build itself, then
+        # delocate-wheel, then installs the wheel into a throwaway venv and
+        # imports it.  MACOSX_DEPLOYMENT_TARGET keeps the platform tag of the
+        # libraries built here from exceeding the runner's own version.
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
+        run: scripts/build-wheel.sh .venv/bin/python
+      - uses: actions/upload-artifact@v4
+        with:
+          name: h2py-examples-wheel-macos
+          path: build/wheelhouse/*.whl
+          retention-days: 7
+
+  fourmolu:
+    name: Fourmolu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: fourmolu/fourmolu-action@v13
+        with:
+          # fourmolu reads default-extensions from library stanzas only, not
+          # from the foreign-library of h2py-examples, so that stanza's
+          # extensions (and GHC2021's ImportQualifiedPost) are passed by hand;
+          # they are harmless for the files that already declare them.
+          extra-args: "-o -XImportQualifiedPost -o -XLinearTypes -o -XQualifiedDo -o -XBlockArguments -o -XDataKinds -o -XTypeOperators -o -XLambdaCase -o -XOverloadedStrings -o -XDerivingStrategies -o -XExplicitNamespaces"
+          pattern: |
+            **/*.hs
+            !**/Setup.hs
+            !dist-newstyle/**
+
+  cabal-check:
+    name: Cabal check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: haskell-actions/setup@v2
+        with:
+          ghc-version: "9.12.4"
+          cabal-version: latest
+          cabal-update: false
+      - run: bash ./ci/scripts/cabal-check-packages.sh
