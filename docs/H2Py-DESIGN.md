@@ -765,7 +765,7 @@ NumPy's own C API is never linked; the buffer protocol suffices in both directio
 - The process is multithreaded from the moment the module is imported, so CPython 3.12 and later warn on every `os.fork()`, and `multiprocessing`'s Linux default would fork a live RTS.
   Module init registers an after-fork child hook through `os.register_at_fork` that makes every trampoline raise `RuntimeError` naming the `spawn` start method, instead of deadlocking on a capability owned by a thread that no longer exists.
 - One Haskell-built extension module per process in 0.1.
-  `auditwheel` renames the bundled `libHSrts` per wheel, so two H2Py wheels never share an RTS even under `RTLD_GLOBAL`, and two RTS instances in one process are not designed to coexist.
+  Each wheel bundles its own copy of the runtime, and two copies in one process do not stay apart: `auditwheel` renames files, not symbols, so under `RTLD_GLOBAL` a second wheel's libraries bind to the first wheel's runtime, and on macOS GHC's libraries bind runtime symbols through the flat namespace anyway, so importing a second H2Py wheel aborts the interpreter.
   The roadmap item is a shared `libh2py-rts` that all modules link against.
 
 ### 5.10 Build and distribution
