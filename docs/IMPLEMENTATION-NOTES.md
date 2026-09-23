@@ -196,7 +196,7 @@ Every finding was fixed or answered:
     `scripts/build-wheel.sh` runs its Python steps isolated, since the `build/` directory at the root passed for the `build` package when it was not installed.
     `scripts/install-module.sh` replaces the module with a new file, since macOS kills a process that maps a signed binary rewritten in place after it had been loaded.
 67. **Deferred, with reasons.**
-    Two H2Py modules in one process: design 5.9's statement that auditwheel's renaming keeps two wheels apart even under `RTLD_GLOBAL` is wrong, since renaming changes sonames and not symbols, and on macOS the flat namespace makes a second module abort; a guard that turns the second import into an `ImportError` is separate work.
+    Two H2Py modules in one process: design 5.9 said auditwheel's renaming kept two wheels apart even under `RTLD_GLOBAL`, which is wrong, since renaming changes sonames and not symbols, and on macOS the flat namespace makes a second module abort; the design is corrected, and a guard that turns the second import into an `ImportError` is separate work.
     Making the wheel scripts reusable by downstream projects (package directory, module name and smoke test as parameters) is separate work too.
 
 The implementation review, again three reviewers with one lens each, found the following, all fixed but one:
